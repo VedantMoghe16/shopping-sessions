@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <future>
 #include <iostream>
@@ -10,6 +11,7 @@
 #include <numeric>
 #include <thread>
 #include <utility>
+#include <nlohmann/json.hpp>
 
 namespace shopping {
 constexpr size_t partitions = 256;
@@ -186,8 +188,39 @@ struct Click {
     uint32_t campaign;
 };
 
+class CandidateBuffers {
+    static constexpr size_t page_rows = 2048;
+    std::vector<std::unique_ptr<Candidate[]>> pages_;
+    size_t size_ = 0;
+
+public:
+    size_t size() const { return size_; }
+
+    void push_back(const Candidate& row) {
+        const size_t offset = size_ % page_rows;
+        if (offset == 0) pages_.push_back(std::unique_ptr<Candidate[]>(new Candidate[page_rows]));
+        pages_.back()[offset] = row;
+        ++size_;
+    }
+
+    template<class Visit>
+    void each(Visit visit) const {
+        size_t remaining = size_;
+        for (const auto& page : pages_) {
+            const size_t count = std::min(page_rows, remaining);
+            for (size_t i = 0; i < count; ++i) visit(page[i]);
+            remaining -= count;
+        }
+    }
+
+    void clear() {
+        pages_.clear();
+        size_ = 0;
+    }
+};
+
 struct WorkerInput {
-    std::array<std::vector<Candidate>, partitions> candidates;
+    std::array<CandidateBuffers, partitions> candidates;
     std::array<std::vector<Event>, partitions> events;
     std::array<std::vector<Click>, partitions> clicks;
 };
@@ -257,7 +290,7 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
     std::vector<uint64_t> seen(buckets / 64), collided(buckets / 64);
     size_t repeats = 0;
     for (const auto& worker : workers) {
-        for (const auto& row : worker.candidates[part]) {
+        worker.candidates[part].each([&](const Candidate& row) {
             const size_t bucket = (hash_key(row.id) >> 8) & (buckets - 1);
             const uint64_t bit = uint64_t{1} << (bucket & 63);
             const size_t word = bucket >> 6;
@@ -265,7 +298,7 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
             repeats += hit != 0;
             collided[word] |= hit;
             seen[word] |= bit;
-        }
+        });
     }
     size_t slots = 1;
     // Every collided bucket contains at most twice its number of repeat visits.
@@ -277,7 +310,7 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
         writer.events[partition(event.person)].push_back(event);
     };
     for (const auto& worker : workers) {
-        for (const auto& row : worker.candidates[part]) {
+        worker.candidates[part].each([&](const Candidate& row) {
             const uint64_t hash = hash_key(row.id) >> 8;
             const size_t bucket = hash & (buckets - 1);
             if ((collided[bucket >> 6] & (uint64_t{1} << (bucket & 63))) == 0) {
@@ -287,12 +320,12 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
                 while (winners[i] && winners[i]->id != row.id) i = (i + 1) & (slots - 1);
                 if (!winners[i] || row.ingest < winners[i]->ingest) winners[i] = &row;
             }
-        }
+        });
     }
     for (const Candidate* winner : winners) {
         if (winner) emit(winner->event);
     }
-    for (auto& worker : workers) std::vector<Candidate>().swap(worker.candidates[part]);
+    for (auto& worker : workers) worker.candidates[part].clear();
 }
 
 struct PersonGroup {
@@ -318,6 +351,7 @@ public:
     uint32_t add(Key person) {
         size_t index = slot(person);
         if (!slots_[index]) {
+            if (groups.size() == UINT32_MAX) throw std::runtime_error("too many people in partition");
             if ((groups.size() + 1) * 4 > slots_.size() * 3) {
                 slots_.assign(slots_.size() * 2, 0);
                 for (size_t i = 0; i < groups.size(); ++i) {
@@ -334,9 +368,21 @@ public:
     uint32_t lookup(Key person) const { return slots_[slot(person)]; }
 };
 
+struct TimedEvent {
+    Time time;
+    uint32_t cents, category;
+};
+
+struct TimedClick {
+    Time time;
+    Key id;
+    uint32_t campaign;
+};
+
 struct PersonPartition {
-    std::vector<Event> events;
-    std::vector<Click> clicks;
+    std::vector<TimedEvent> events;
+    std::vector<TimedClick> clicks;
+    std::vector<PersonGroup> groups;
 };
 
 PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) {
@@ -358,14 +404,8 @@ PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) 
             }
         }
     }
-    std::vector<uint32_t> order(index.groups.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](uint32_t left, uint32_t right) {
-        return index.groups[left].person < index.groups[right].person;
-    });
     size_t event_offset = 0, click_offset = 0;
-    for (uint32_t group_id : order) {
-        PersonGroup& group = index.groups[group_id];
+    for (PersonGroup& group : index.groups) {
         group.event_end = event_offset += group.events;
         group.click_end = click_offset += group.clicks;
     }
@@ -373,28 +413,31 @@ PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) 
     result.events.resize(event_count);
     result.clicks.resize(click_count);
     for (auto& worker : workers) {
-        for (Event event : worker.events[part]) {
+        for (const Event& event : worker.events[part]) {
             PersonGroup& group = index.groups[event.person];
-            event.person = group.person;
-            result.events[--group.event_end] = event;
+            result.events[--group.event_end] = {event.time, event.cents, event.category};
         }
         std::vector<Event>().swap(worker.events[part]);
-        for (Click click : worker.clicks[part]) {
+        for (const Click& click : worker.clicks[part]) {
             if (click.person) {
                 PersonGroup& group = index.groups[click.person - 1];
-                click.person = group.person;
-                result.clicks[--group.click_end] = click;
+                result.clicks[--group.click_end] = {click.time, click.id, click.campaign};
             }
         }
         std::vector<Click>().swap(worker.clicks[part]);
     }
     const auto earlier = [](const auto& a, const auto& b) { return a.time < b.time; };
     for (const PersonGroup& group : index.groups) {
-        auto e = result.events.begin() + group.event_end;
-        auto c = result.clicks.begin() + group.click_end;
-        if (group.events > 1) std::sort(e, e + group.events, earlier);
-        if (group.clicks > 1) std::sort(c, c + group.clicks, earlier);
+        if (group.events > 1) {
+            auto begin = result.events.begin() + group.event_end;
+            std::sort(begin, begin + group.events, earlier);
+        }
+        if (group.clicks > 1) {
+            auto begin = result.clicks.begin() + group.click_end;
+            std::sort(begin, begin + group.clicks, earlier);
+        }
     }
+    result.groups = std::move(index.groups);
     return result;
 }
 
@@ -460,7 +503,7 @@ public:
 
     void start_session() { ++sessions_; }
 
-    void event(const Event& event) {
+    void event(const TimedEvent& event) {
         ++events_;
         if (event.cents != 0) {
             int64_t& category = categories_[event.category];
@@ -498,12 +541,12 @@ struct Attribution {
     Attribution(CampaignDays& totals, Keys& keys, size_t campaigns)
         : totals(totals), keys(keys), covered(campaigns) {}
 
-    void credit(const std::vector<Session>& sessions, const std::vector<Click>& clicks,
+    void credit(const std::vector<Session>& sessions, const std::vector<TimedClick>& clicks,
                 size_t begin, size_t end) {
-        const Click* best = nullptr;
+        const TimedClick* best = nullptr;
         for (const Session& session : sessions) {
             while (begin < end && clicks[begin].time <= session.start) {
-                const Click& click = clicks[begin++];
+                const TimedClick& click = clicks[begin++];
                 if (!best || click.time > best->time || keys.less(click.id, best->id)) best = &click;
             }
             const uint32_t campaign = best && best->time >= session.start - week_ms ? best->campaign : 0;
@@ -514,7 +557,7 @@ struct Attribution {
         }
     }
 
-    void assist(std::vector<Session>& sessions, const std::vector<Click>& clicks,
+    void assist(std::vector<Session>& sessions, const std::vector<TimedClick>& clicks,
                 size_t begin, size_t end) {
         if (begin == end) return;
         for (size_t i = sessions.size(); i-- > 0;) {
@@ -524,7 +567,7 @@ struct Attribution {
         }
         size_t lo = 0, hi = 0;
         for (; begin < end; ++begin) {
-            const Click& click = clicks[begin];
+            const TimedClick& click = clicks[begin];
             while (lo < sessions.size() && sessions[lo].start < click.time) ++lo;
             if (lo == sessions.size()) break;
             while (hi < sessions.size() && sessions[hi].start <= click.time + week_ms) ++hi;
@@ -545,24 +588,23 @@ struct Attribution {
     }
 };
 
-void summarize(const std::vector<Event>& events, const std::vector<Click>& clicks,
-               Keys& keys, const Catalog& catalog, BatchWriter<3>& writer, CampaignDays& totals) {
+void summarize(const PersonPartition& rows, Keys& keys, const Catalog& catalog,
+               BatchWriter<3>& writer, CampaignDays& totals) {
     PersonDays days(keys, catalog, writer);
     Attribution attribution(totals, keys, catalog.names.size());
     std::vector<Session> sessions;
-    size_t i = 0, c = 0;
-    while (i < events.size()) {
-        const Key user = events[i].person;
-        int32_t day = epoch_day(events[i].time);
-        Time previous = events[i].time;
+    for (const PersonGroup& group : rows.groups) {
+        const size_t event_end = group.event_end + group.events;
+        Time previous = rows.events[group.event_end].time;
+        int32_t day = epoch_day(previous);
         days.start_session();
         sessions.push_back({previous});
-        do {
-            const Event& event = events[i++];
+        for (size_t i = group.event_end; i < event_end; ++i) {
+            const TimedEvent& event = rows.events[i];
             if (event.time - previous > 1800000) {
                 const int32_t next = epoch_day(event.time);
                 if (next != day) {
-                    days.flush(user, day);
+                    days.flush(group.person, day);
                     day = next;
                 }
                 days.start_session();
@@ -571,13 +613,11 @@ void summarize(const std::vector<Event>& events, const std::vector<Click>& click
             days.event(event);
             sessions.back().revenue += event.cents;
             previous = event.time;
-        } while (i < events.size() && events[i].person == user);
-        days.flush(user, day);
-        while (c < clicks.size() && clicks[c].person < user) ++c;
-        const size_t begin = c;
-        while (c < clicks.size() && clicks[c].person == user) ++c;
-        attribution.credit(sessions, clicks, begin, c);
-        attribution.assist(sessions, clicks, begin, c);
+        }
+        days.flush(group.person, day);
+        const size_t click_end = group.click_end + group.clicks;
+        attribution.credit(sessions, rows.clicks, group.click_end, click_end);
+        attribution.assist(sessions, rows.clicks, group.click_end, click_end);
         sessions.clear();
     }
 }
@@ -592,7 +632,7 @@ public:
     }
 };
 
-int run(const fs::path& data, const fs::path& scratch, Time start, Time end, size_t ncpu) {
+int run(const fs::path& data, const fs::path& output, Time start, Time end, size_t ncpu) {
     if (start == bad_time || end == bad_time || end <= start || ncpu == 0) {
         throw std::runtime_error("invalid window or CPU count");
     }
@@ -658,16 +698,20 @@ int run(const fs::path& data, const fs::path& scratch, Time start, Time end, siz
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return sizes[a] > sizes[b]; });
     std::vector<std::unique_ptr<BatchWriter<3>>> writers;
     std::vector<CampaignDays> counts;
+    const fs::path user_output = output / "user_daily";
+    const fs::path campaign_output = output / "campaign_daily";
+    fs::create_directories(user_output);
+    fs::create_directories(campaign_output);
     for (size_t worker = 0; worker < ncpu; ++worker) {
-        writers.push_back(std::make_unique<BatchWriter<3>>(scratch / ("user-" + std::to_string(worker))));
+        writers.push_back(std::make_unique<BatchWriter<3>>(user_output / ("part-" + std::to_string(worker) + ".parquet")));
         counts.emplace_back(start, end, catalog.names.size());
     }
     parallel(ncpu, partitions, [&](size_t worker, size_t task) {
         const size_t part = order[task];
         const auto rows = group_by_person(workers, part);
-        summarize(rows.events, rows.clicks, keys, catalog, *writers[worker], counts[worker]);
+        summarize(rows, keys, catalog, *writers[worker], counts[worker]);
     });
-    for (auto& writer : writers) writer->close();
+    parallel(ncpu, writers.size(), [&](size_t, size_t i) { writers[i]->close(); });
 
     CampaignDays total(start, end, catalog.names.size());
     for (const auto& worker : counts) {
@@ -675,7 +719,7 @@ int run(const fs::path& data, const fs::path& scratch, Time start, Time end, siz
             total.get(campaign, day).add(value);
         });
     }
-    BatchWriter<4> campaigns(scratch / "campaign");
+    BatchWriter<4> campaigns(campaign_output / "part-0.parquet");
     total.each([&](uint32_t campaign, int32_t day, const Totals& value) {
         const auto& names = catalog.names[campaign];
         char id_buffer[9], channel_buffer[9];
@@ -683,16 +727,26 @@ int run(const fs::path& data, const fs::path& scratch, Time start, Time end, siz
                       {value.credit, value.purchasing, value.revenue, value.assist});
     });
     campaigns.close();
-    timer.stage("sort, aggregate, stage output");
+    timer.stage("sort, aggregate, parquet");
     return 0;
 }
 }
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 6) throw std::runtime_error("expected data, scratch, window start, window end and NCPU");
-        return shopping::run(argv[1], argv[2], shopping::timestamp(argv[3], true),
-                             shopping::timestamp(argv[4], true), std::stoul(argv[5]));
+        if (argc != 1 && argc != 3) throw std::runtime_error("expected optional data and output directories");
+        const auto environment = [](const char* name, const char* fallback) {
+            const char* value = std::getenv(name);
+            return value ? value : fallback;
+        };
+        const shopping::fs::path data = argc == 3 ? argv[1] : environment("DATA_DIR", "/data");
+        const shopping::fs::path output = argc == 3 ? argv[2] : environment("OUTPUT_DIR", "/output");
+        const shopping::MappedFile manifest(data / "manifest.json");
+        const shopping::Text bytes = manifest.bytes();
+        const auto window = nlohmann::json::parse(bytes.begin(), bytes.end());
+        const auto start = shopping::timestamp(window.at("window_start").get<std::string>(), true);
+        const auto end = shopping::timestamp(window.at("window_end").get<std::string>(), true);
+        return shopping::run(data, output, start, end, std::stoul(environment("NCPU", "8")));
     } catch (const std::exception& error) {
         std::cerr << "shopping sessions: " << error.what() << '\n';
         return 1;

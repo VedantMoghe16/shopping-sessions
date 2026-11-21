@@ -181,20 +181,21 @@ bool fields_simd(Text row, std::array<Text, N>& output) {
         quotes |= DelimiterMask(quote_mask >> skip) << position;
     }
     size_t begin = 0;
-    DelimiterMask outer_quotes = 0;
+    unsigned outer_quotes = 0;
     for (size_t i = 0; i < N; ++i) {
         if ((commas == 0) != (i == N - 1)) return false;
         const size_t end = commas ? first_bit(commas) : row.size();
         commas &= commas - 1;
-        if (end - begin >= 2 && row[begin] == '"' && row[end - 1] == '"') {
-            outer_quotes |= (DelimiterMask{1} << begin) | (DelimiterMask{1} << (end - 1));
-            output[i] = row.substr(begin + 1, end - begin - 2);
-        } else {
-            output[i] = row.substr(begin, end - begin);
-        }
+        const size_t length = end - begin;
+        const size_t trim = length >= 2 && row[begin] == '"' && row[end - 1] == '"';
+        outer_quotes += 2 * trim;
+        output[i] = Text(row.data() + begin + trim, length - 2 * trim);
         begin = end + 1;
     }
-    return quotes == outer_quotes;
+    // Every counted boundary quote is already in the mask.
+    return outer_quotes == static_cast<unsigned>(
+        __builtin_popcountll(static_cast<uint64_t>(quotes)) +
+        __builtin_popcountll(static_cast<uint64_t>(quotes >> 64)));
 }
 #endif
 
