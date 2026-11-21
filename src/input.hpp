@@ -210,22 +210,53 @@ bool fields_simd(Text row, std::array<Text, N>& output) {
         commas |= DelimiterMask(comma_mask >> skip) << position;
         quotes |= DelimiterMask(quote_mask >> skip) << position;
     }
-    size_t begin = 0;
+    const auto low = static_cast<uint64_t>(commas);
+    const auto high = static_cast<uint64_t>(commas >> 64);
+    const unsigned low_count = __builtin_popcountll(low);
+    if (low_count + __builtin_popcountll(high) != N - 1) return false;
+
+#ifdef __BMI2__
+    unsigned quoted = 0;
+    if (quotes) {
+        const DelimiterMask last = DelimiterMask{1} << (row.size() - 1);
+        const DelimiterMask opening = (commas << 1) | 1;
+        const DelimiterMask closing = (commas >> 1) | last;
+        if (quotes & ~(opening ^ closing)) return false;
+        const auto by_field = [&](DelimiterMask shifted) {
+            return _pext_u64(static_cast<uint64_t>(shifted), low) |
+                (_pext_u64(static_cast<uint64_t>(shifted >> 64), high) << low_count);
+        };
+        const unsigned left = (by_field(quotes >> 1) << 1) | (quotes & 1);
+        const unsigned right = by_field(quotes << 1) | ((quotes & last) ? (1u << (N - 1)) : 0u);
+        if (left != right) return false;
+        quoted = left;
+    }
+#else
     unsigned outer_quotes = 0;
+#endif
+
+    size_t begin = 0;
     for (size_t i = 0; i < N; ++i) {
-        if ((commas == 0) != (i == N - 1)) return false;
-        const size_t end = commas ? first_bit(commas) : row.size();
+        const size_t end = i < N - 1 ? first_bit(commas) : row.size();
         commas &= commas - 1;
         const size_t length = end - begin;
+#ifdef __BMI2__
+        const size_t trim = (quoted >> i) & 1;
+#else
         const size_t trim = length >= 2 && row[begin] == '"' && row[end - 1] == '"';
         outer_quotes += 2 * trim;
+#endif
         output[i] = Text(row.data() + begin + trim, length - 2 * trim);
         begin = end + 1;
     }
+#ifdef __BMI2__
+    return true;
+#else
     // Every counted boundary quote is already in the mask.
     return outer_quotes == static_cast<unsigned>(
         __builtin_popcountll(static_cast<uint64_t>(quotes)) +
         __builtin_popcountll(static_cast<uint64_t>(quotes >> 64)));
+#endif
 }
 #endif
 
