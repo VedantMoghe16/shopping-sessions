@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -50,8 +51,8 @@ using KeyMap = std::unordered_map<Key, Value, KeyHash>;
 class Keys {
     static constexpr Key wide = Key{1} << 63;
     std::mutex mutex_;
+    std::deque<std::string> strings_;
     std::unordered_map<Text, Key> indices_;
-    std::vector<Text> strings_;
 
     static Text decode(Key key, char (&buffer)[9]) {
         size_t size = 0;
@@ -89,9 +90,12 @@ public:
             }
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        auto entry = indices_.try_emplace(text, wide | strings_.size());
-        if (entry.second) strings_.push_back(text);
-        return entry.first->second;
+        const auto prior = indices_.find(text);
+        if (prior != indices_.end()) return prior->second;
+        const Key key = wide | strings_.size();
+        strings_.emplace_back(text);
+        indices_.emplace(Text(strings_.back()), key);
+        return key;
     }
 
     Text text(Key key, char (&buffer)[9]) {

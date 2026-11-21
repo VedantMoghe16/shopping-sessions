@@ -56,14 +56,14 @@ class BatchWriter {
     static const arrow::Schema& schema() {
         static const auto schema = [] {
             std::vector<std::shared_ptr<arrow::Field>> fields;
-            fields.push_back(arrow::field(Count == 3 ? "user_id" : "campaign_id", arrow::utf8()));
-            if constexpr (Count == 4) fields.push_back(arrow::field("channel", arrow::utf8()));
-            fields.push_back(arrow::field("day", arrow::date32()));
-            fields.push_back(arrow::field("sessions", arrow::int64()));
-            fields.push_back(arrow::field(Count == 3 ? "events" : "purchasing_sessions", arrow::int64()));
-            fields.push_back(arrow::field("revenue_cents", arrow::int64()));
+            fields.push_back(arrow::field(Count == 3 ? "user_id" : "campaign_id", arrow::utf8(), false));
+            if constexpr (Count == 4) fields.push_back(arrow::field("channel", arrow::utf8(), false));
+            fields.push_back(arrow::field("day", arrow::date32(), false));
+            fields.push_back(arrow::field("sessions", arrow::int64(), false));
+            fields.push_back(arrow::field(Count == 3 ? "events" : "purchasing_sessions", arrow::int64(), false));
+            fields.push_back(arrow::field("revenue_cents", arrow::int64(), false));
             if constexpr (Count == 3) fields.push_back(arrow::field("top_category", arrow::utf8()));
-            else fields.push_back(arrow::field("assisted_sessions", arrow::int64()));
+            else fields.push_back(arrow::field("assisted_sessions", arrow::int64(), false));
             return arrow::schema(std::move(fields));
         }();
         return *schema;
@@ -74,8 +74,12 @@ public:
         auto file = arrow::io::FileOutputStream::Open(path.string());
         check_arrow(file.status());
         file_ = std::move(file).ValueOrDie();
-        static const auto properties = parquet::WriterProperties::Builder()
-            .compression(parquet::Compression::SNAPPY)->build();
+        static const auto properties = [] {
+            parquet::WriterProperties::Builder options;
+            options.compression(parquet::Compression::SNAPPY)->disable_statistics();
+            if constexpr (Count == 3) options.disable_dictionary("user_id");
+            return options.build();
+        }();
         static const auto arrow_properties = parquet::ArrowWriterProperties::Builder()
             .set_use_threads(false)->build();
         auto writer = parquet::arrow::FileWriter::Open(schema(), arrow::default_memory_pool(),

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <exception>
 #include <future>
@@ -16,6 +17,11 @@
 namespace shopping {
 constexpr size_t partitions = 256;
 constexpr size_t chunk_bytes = 4 * 1024 * 1024;
+constexpr Time session_gap = 1800000;
+#ifndef SHOPPING_BUCKET_THRESHOLD
+#define SHOPPING_BUCKET_THRESHOLD 16
+#endif
+constexpr size_t bucket_threshold = SHOPPING_BUCKET_THRESHOLD;
 
 size_t partition(Key key) { return hash_key(key) & (partitions - 1); }
 
@@ -44,6 +50,7 @@ void parallel(size_t workers, size_t tasks, Work work) {
 
 struct Inputs {
     std::vector<std::unique_ptr<MappedFile>> files;
+    std::vector<std::unique_ptr<fs::path>> paths;
 
     Text map(const fs::path& path) {
         files.push_back(std::make_unique<MappedFile>(path));
@@ -55,7 +62,8 @@ struct Inputs {
         for (const auto& file : fs::directory_iterator(path)) {
             if (file.path().extension() == ".csv" && file.is_regular_file()) {
                 const Text bytes = map(file.path());
-                visit(bytes.substr(next_line(bytes, 0)));
+                paths.push_back(std::make_unique<fs::path>(file.path()));
+                visit(bytes, *paths.back());
             }
         }
     }
@@ -169,12 +177,45 @@ Catalog load_catalog(Inputs& inputs, const fs::path& data, Keys& keys) {
     return catalog;
 }
 
-struct Event {
-    Key person;
+struct TimedEvent {
     Time time;
     uint32_t cents, category;
 };
 
+struct WideEvents {
+    struct Event {
+        Key person;
+        TimedEvent data;
+    };
+
+    Event make(Key person, Time time, uint32_t cents, uint32_t category) const {
+        return {person, {time, cents, category}};
+    }
+
+    TimedEvent decode(const Event& event) const { return event.data; }
+};
+
+struct CompactEvents {
+    static constexpr uint32_t price_bits = 24;
+    static constexpr uint32_t price_mask = (uint32_t{1} << price_bits) - 1;
+
+    struct Event {
+        Key person;
+        uint32_t offset, purchase;
+    };
+
+    Time start;
+
+    Event make(Key person, Time time, uint32_t cents, uint32_t category) const {
+        return {person, static_cast<uint32_t>(time - start), (category << price_bits) | cents};
+    }
+
+    TimedEvent decode(const Event& event) const {
+        return {start + event.offset, event.purchase & price_mask, event.purchase >> price_bits};
+    }
+};
+
+template<class Event>
 struct Candidate {
     Key id;
     Time ingest;
@@ -188,17 +229,18 @@ struct Click {
     uint32_t campaign;
 };
 
+template<class Event>
 class CandidateBuffers {
     static constexpr size_t page_rows = 2048;
-    std::vector<std::unique_ptr<Candidate[]>> pages_;
+    std::vector<std::unique_ptr<Candidate<Event>[]>> pages_;
     size_t size_ = 0;
 
 public:
     size_t size() const { return size_; }
 
-    void push_back(const Candidate& row) {
+    void push_back(const Candidate<Event>& row) {
         const size_t offset = size_ % page_rows;
-        if (offset == 0) pages_.push_back(std::unique_ptr<Candidate[]>(new Candidate[page_rows]));
+        if (offset == 0) pages_.push_back(std::unique_ptr<Candidate<Event>[]>(new Candidate<Event>[page_rows]));
         pages_.back()[offset] = row;
         ++size_;
     }
@@ -219,56 +261,94 @@ public:
     }
 };
 
+template<class Event>
 struct WorkerInput {
-    std::array<CandidateBuffers, partitions> candidates;
+    std::array<CandidateBuffers<Event>, partitions> candidates;
     std::array<std::vector<Event>, partitions> events;
     std::array<std::vector<Click>, partitions> clicks;
 };
 
-struct Chunk { Text bytes; bool events; };
+struct Chunk {
+    size_t offset, size;
+    const fs::path* path;
+    const char* mapped;
+    bool events;
+};
 
 void load_chunks(Inputs& inputs, const fs::path& path, bool events, std::vector<Chunk>& chunks) {
-    inputs.folder(path, [&](Text bytes) {
-        size_t begin = 0;
+    inputs.folder(path, [&](Text bytes, const fs::path& source) {
+        size_t begin = next_line(bytes, 0);
         while (begin < bytes.size()) {
             size_t end = std::min(begin + chunk_bytes, bytes.size());
             if (end != bytes.size() && bytes[end - 1] != '\n') end = next_line(bytes, end);
-            chunks.push_back({bytes.substr(begin, end - begin), events});
+            chunks.push_back({begin, end - begin, &source, bytes.data() + begin, events});
             begin = end;
         }
     });
 }
 
+class ChunkReader {
+    std::unique_ptr<char[]> buffer_;
+    size_t capacity_ = 0;
+
+public:
+    Text read(const Chunk& chunk) {
+        // A single long row can extend a chunk past the usual buffer size.
+        if (chunk.size > 2 * chunk_bytes) return Text(chunk.mapped, chunk.size);
+        if (capacity_ < chunk.size) {
+            buffer_.reset(new char[chunk.size]);
+            capacity_ = chunk.size;
+        }
+        const int fd = open(chunk.path->c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("open " + chunk.path->string());
+        size_t offset = 0;
+        while (offset < chunk.size) {
+            const auto got = pread(fd, buffer_.get() + offset, chunk.size - offset, chunk.offset + offset);
+            if (got <= 0) {
+                if (got < 0 && errno == EINTR) continue;
+                close(fd);
+                throw std::runtime_error("read " + chunk.path->string());
+            }
+            offset += static_cast<size_t>(got);
+        }
+        close(fd);
+        return Text(buffer_.get(), chunk.size);
+    }
+};
+
+template<class Layout>
 void event_chunk(Text bytes, Keys& keys, const Catalog& catalog,
-                 WorkerInput& worker, Time start, Time end) {
+                 WorkerInput<typename Layout::Event>& worker, Time start, Time end,
+                 const Layout& layout) {
     std::array<Text, 7> c;
     lines(bytes, [&](Text row) {
         if (!fields(row, c) || c[0].empty()) return;
-        const Key id = keys.encode(c[0]);
+        // The mixer is a bijection, so its result remains an exact event key.
+        const Key id = hash_key(keys.encode(c[0]));
         const Time ingest = timestamp(c[3], true);
         if (ingest == bad_time) throw std::runtime_error("invalid guaranteed ingest_ts");
-        Event event{0, bad_time, 0, 0};
+        typename Layout::Event event{};
         const Time time = timestamp(c[2]);
         const bool purchase = c[4] == "purchase";
         if (!c[1].empty() && !c[5].empty() && (purchase || c[4] == "view" || c[4] == "cart")
             && time >= start && time < end && ingest - time <= day_ms) {
             const Time price = purchase ? digits(c[6], 10000000) : 0;
             if (!purchase || price > 0) {
-                event.person = keys.encode(c[1]);
-                event.time = time;
-                event.cents = static_cast<uint32_t>(price);
+                uint32_t category = 0;
                 if (purchase) {
                     const auto found = catalog.products.find(keys.encode(c[5]));
-                    if (found != catalog.products.end()) event.category = found->second;
+                    if (found != catalog.products.end()) category = found->second;
                 }
+                event = layout.make(keys.encode(c[1]), time, static_cast<uint32_t>(price), category);
             }
         }
-        worker.candidates[partition(id)].push_back({id, ingest, event});
+        worker.candidates[id & (partitions - 1)].push_back({id, ingest, event});
     });
 }
 
+template<class Event>
 void click_chunk(Text bytes, Keys& keys, const Catalog& catalog, const Links& links,
-                 WorkerInput& worker, Time start, Time end) {
+                 WorkerInput<Event>& worker, Time start, Time end) {
     std::array<Text, 4> c;
     lines(bytes, [&](Text row) {
         if (!fields(row, c) || c[0].empty() || c[1].empty() || c[2].empty()) return;
@@ -281,7 +361,8 @@ void click_chunk(Text bytes, Keys& keys, const Catalog& catalog, const Links& li
     });
 }
 
-void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& writer, const Links& links) {
+template<class Event>
+void deduplicate(size_t part, std::vector<WorkerInput<Event>>& workers, WorkerInput<Event>& writer, const Links& links) {
     size_t count = 0;
     for (const auto& worker : workers) count += worker.candidates[part].size();
     if (!count) return;
@@ -290,8 +371,8 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
     std::vector<uint64_t> seen(buckets / 64), collided(buckets / 64);
     size_t repeats = 0;
     for (const auto& worker : workers) {
-        worker.candidates[part].each([&](const Candidate& row) {
-            const size_t bucket = (hash_key(row.id) >> 8) & (buckets - 1);
+        worker.candidates[part].each([&](const Candidate<Event>& row) {
+            const size_t bucket = (row.id >> 8) & (buckets - 1);
             const uint64_t bit = uint64_t{1} << (bucket & 63);
             const size_t word = bucket >> 6;
             const uint64_t hit = seen[word] & bit;
@@ -303,15 +384,15 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
     size_t slots = 1;
     // Every collided bucket contains at most twice its number of repeat visits.
     while (slots < repeats * 3 + 1) slots *= 2;
-    std::vector<const Candidate*> winners(slots, nullptr);
+    std::vector<const Candidate<Event>*> winners(slots, nullptr);
     auto emit = [&](Event event) {
-        if (event.time == bad_time) return;
+        if (event.person == 0) return;
         event.person = links.person(event.person);
         writer.events[partition(event.person)].push_back(event);
     };
     for (const auto& worker : workers) {
-        worker.candidates[part].each([&](const Candidate& row) {
-            const uint64_t hash = hash_key(row.id) >> 8;
+        worker.candidates[part].each([&](const Candidate<Event>& row) {
+            const uint64_t hash = row.id >> 8;
             const size_t bucket = hash & (buckets - 1);
             if ((collided[bucket >> 6] & (uint64_t{1} << (bucket & 63))) == 0) {
                 emit(row.event);
@@ -322,7 +403,7 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
             }
         });
     }
-    for (const Candidate* winner : winners) {
+    for (const Candidate<Event>* winner : winners) {
         if (winner) emit(winner->event);
     }
     for (auto& worker : workers) worker.candidates[part].clear();
@@ -368,11 +449,6 @@ public:
     uint32_t lookup(Key person) const { return slots_[slot(person)]; }
 };
 
-struct TimedEvent {
-    Time time;
-    uint32_t cents, category;
-};
-
 struct TimedClick {
     Time time;
     Key id;
@@ -385,7 +461,10 @@ struct PersonPartition {
     std::vector<PersonGroup> groups;
 };
 
-PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) {
+template<class Layout>
+PersonPartition group_by_person(std::vector<WorkerInput<typename Layout::Event>>& workers, size_t part,
+                                size_t bucket_count, const Layout& layout) {
+    using Event = typename Layout::Event;
     PersonGroups index;
     size_t event_count = 0, click_count = 0;
     for (auto& worker : workers) {
@@ -415,7 +494,7 @@ PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) 
     for (auto& worker : workers) {
         for (const Event& event : worker.events[part]) {
             PersonGroup& group = index.groups[event.person];
-            result.events[--group.event_end] = {event.time, event.cents, event.category};
+            result.events[--group.event_end] = layout.decode(event);
         }
         std::vector<Event>().swap(worker.events[part]);
         for (const Click& click : worker.clicks[part]) {
@@ -428,14 +507,11 @@ PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) 
     }
     const auto earlier = [](const auto& a, const auto& b) { return a.time < b.time; };
     for (const PersonGroup& group : index.groups) {
-        if (group.events > 1) {
+        if (group.events > 1 && (!bucket_count || group.events < bucket_threshold)) {
             auto begin = result.events.begin() + group.event_end;
             std::sort(begin, begin + group.events, earlier);
         }
-        if (group.clicks > 1) {
-            auto begin = result.clicks.begin() + group.click_end;
-            std::sort(begin, begin + group.clicks, earlier);
-        }
+
     }
     result.groups = std::move(index.groups);
     return result;
@@ -502,6 +578,7 @@ public:
         : keys_(keys), catalog_(catalog), writer_(writer), categories_(catalog.categories.size()) {}
 
     void start_session() { ++sessions_; }
+    void add_events(size_t count) { events_ += count; }
 
     void event(const TimedEvent& event) {
         ++events_;
@@ -536,10 +613,83 @@ public:
 struct Attribution {
     CampaignDays& totals;
     Keys& keys;
+    static constexpr size_t mask_capacity = 64;
     std::vector<size_t> covered, touched;
+    std::vector<uint64_t> masks;
 
     Attribution(CampaignDays& totals, Keys& keys, size_t campaigns)
-        : totals(totals), keys(keys), covered(campaigns) {}
+        : totals(totals), keys(keys), covered(campaigns), masks(campaigns) {}
+
+    void add_credit(const Session& session, const TimedClick* best) {
+        const uint32_t campaign = best && best->time >= session.start - week_ms ? best->campaign : 0;
+        Totals& day = totals.get(campaign, epoch_day(session.start));
+        ++day.credit;
+        day.purchasing += session.revenue > 0;
+        day.revenue += session.revenue;
+    }
+
+    static uint64_t range_mask(size_t begin, size_t end) {
+        const uint64_t prefix = end == mask_capacity ? UINT64_MAX : ((uint64_t{1} << end) - 1);
+        return prefix & (UINT64_MAX << begin);
+    }
+
+    void small(const std::vector<Session>& sessions, const std::vector<TimedClick>& clicks,
+               size_t begin, size_t end) {
+        std::array<const TimedClick*, mask_capacity> latest;
+        std::fill_n(latest.begin(), sessions.size(), nullptr);
+        const Time first_start = sessions.front().start;
+        const Time last_start = sessions.back().start;
+        for (; begin < end; ++begin) {
+            const TimedClick& click = clicks[begin];
+            const Time last_eligible = click.time + week_ms;
+            if (click.time > last_start || last_eligible < first_start) continue;
+            const auto lo = click.time <= first_start ? sessions.begin() :
+                std::lower_bound(sessions.begin(), sessions.end(), click.time,
+                    [](const Session& session, Time time) { return session.start < time; });
+            if (lo->start > last_eligible) continue;
+            const auto hi = last_eligible >= last_start ? sessions.end() :
+                std::upper_bound(lo, sessions.end(), last_eligible,
+                    [](Time time, const Session& session) { return time < session.start; });
+            const size_t first = lo - sessions.begin();
+            const size_t stop = hi - sessions.begin();
+
+            uint64_t& mask = masks[click.campaign];
+            if (mask == 0) touched.push_back(click.campaign);
+            mask |= range_mask(first, stop);
+
+            const TimedClick*& winner = latest[first];
+            if (!winner || click.time > winner->time ||
+                (click.time == winner->time && keys.less(click.id, winner->id))) winner = &click;
+        }
+
+        const TimedClick* best = nullptr;
+        for (size_t i = 0; i < sessions.size(); ++i) {
+            // A later first eligible index implies a strictly later click time.
+            if (latest[i]) best = latest[i];
+            add_credit(sessions[i], best);
+        }
+        if (touched.empty()) return;
+        std::array<uint64_t, mask_capacity> day_masks;
+        for (size_t i = 0; i < sessions.size();) {
+            const int32_t day = epoch_day(sessions[i].start);
+            size_t j = i + 1;
+            while (j < sessions.size() && epoch_day(sessions[j].start) == day) ++j;
+            std::fill(day_masks.begin() + i, day_masks.begin() + j, range_mask(i, j));
+            i = j;
+        }
+        for (size_t campaign : touched) {
+            uint64_t mask = masks[campaign];
+            while (mask) {
+                const size_t first = __builtin_ctzll(mask);
+                const uint64_t day_mask = day_masks[first];
+                totals.get(static_cast<uint32_t>(campaign), epoch_day(sessions[first].start)).assist +=
+                    __builtin_popcountll(mask & day_mask);
+                mask &= ~day_mask;
+            }
+            masks[campaign] = 0;
+        }
+        touched.clear();
+    }
 
     void credit(const std::vector<Session>& sessions, const std::vector<TimedClick>& clicks,
                 size_t begin, size_t end) {
@@ -549,11 +699,7 @@ struct Attribution {
                 const TimedClick& click = clicks[begin++];
                 if (!best || click.time > best->time || keys.less(click.id, best->id)) best = &click;
             }
-            const uint32_t campaign = best && best->time >= session.start - week_ms ? best->campaign : 0;
-            Totals& day = totals.get(campaign, epoch_day(session.start));
-            ++day.credit;
-            day.purchasing += session.revenue > 0;
-            day.revenue += session.revenue;
+            add_credit(session, best);
         }
     }
 
@@ -588,36 +734,95 @@ struct Attribution {
     }
 };
 
-void summarize(const PersonPartition& rows, Keys& keys, const Catalog& catalog,
-               BatchWriter<3>& writer, CampaignDays& totals) {
+struct TimeBucket {
+    Time first = 0, last = 0;
+    size_t events = 0, purchase = 0;
+};
+
+struct BucketPurchase {
+    size_t previous;
+    uint32_t cents, category;
+};
+
+void summarize(PersonPartition& rows, Keys& keys, const Catalog& catalog,
+               BatchWriter<3>& writer, CampaignDays& totals, Time start, size_t bucket_count) {
     PersonDays days(keys, catalog, writer);
     Attribution attribution(totals, keys, catalog.names.size());
     std::vector<Session> sessions;
+    std::vector<TimeBucket> buckets;
+    std::vector<size_t> occupied;
+    std::vector<BucketPurchase> purchases;
     for (const PersonGroup& group : rows.groups) {
         const size_t event_end = group.event_end + group.events;
-        Time previous = rows.events[group.event_end].time;
-        int32_t day = epoch_day(previous);
-        days.start_session();
-        sessions.push_back({previous});
-        for (size_t i = group.event_end; i < event_end; ++i) {
-            const TimedEvent& event = rows.events[i];
-            if (event.time - previous > 1800000) {
-                const int32_t next = epoch_day(event.time);
-                if (next != day) {
-                    days.flush(group.person, day);
-                    day = next;
-                }
+        Time previous = 0;
+        int32_t day = 0;
+        const auto begin_segment = [&](Time first, Time last) {
+            if (sessions.empty() || first - previous > session_gap) {
+                const int32_t next = epoch_day(first);
+                if (!sessions.empty() && next != day) days.flush(group.person, day);
+                day = next;
                 days.start_session();
-                sessions.push_back({event.time});
+                sessions.push_back({first});
             }
-            days.event(event);
-            sessions.back().revenue += event.cents;
-            previous = event.time;
+            previous = last;
+        };
+        if (bucket_count && group.events >= bucket_threshold) {
+            if (buckets.empty()) buckets.resize(bucket_count);
+            for (size_t i = group.event_end; i < event_end; ++i) {
+                const TimedEvent& event = rows.events[i];
+                const size_t index = (event.time - start) / session_gap;
+                TimeBucket& bucket = buckets[index];
+                if (bucket.events == 0) {
+                    bucket.first = bucket.last = event.time;
+                    occupied.push_back(index);
+                } else {
+                    bucket.first = std::min(bucket.first, event.time);
+                    bucket.last = std::max(bucket.last, event.time);
+                }
+                ++bucket.events;
+                if (event.cents != 0) {
+                    purchases.push_back({bucket.purchase, event.cents, event.category});
+                    bucket.purchase = purchases.size();
+                }
+            }
+            // All events in one bucket are connected by an interval shorter than the gap.
+            std::sort(occupied.begin(), occupied.end());
+            for (size_t index : occupied) {
+                TimeBucket& bucket = buckets[index];
+                begin_segment(bucket.first, bucket.last);
+                size_t nonpurchase = bucket.events;
+                for (size_t p = bucket.purchase; p != 0;) {
+                    const BucketPurchase& purchase = purchases[p - 1];
+                    days.event({bucket.first, purchase.cents, purchase.category});
+                    sessions.back().revenue += purchase.cents;
+                    --nonpurchase;
+                    p = purchase.previous;
+                }
+                days.add_events(nonpurchase);
+                bucket = {};
+            }
+            occupied.clear();
+            purchases.clear();
+        } else {
+            for (size_t i = group.event_end; i < event_end; ++i) {
+                const TimedEvent& event = rows.events[i];
+                begin_segment(event.time, event.time);
+                days.event(event);
+                sessions.back().revenue += event.cents;
+            }
         }
         days.flush(group.person, day);
         const size_t click_end = group.click_end + group.clicks;
-        attribution.credit(sessions, rows.clicks, group.click_end, click_end);
-        attribution.assist(sessions, rows.clicks, group.click_end, click_end);
+        if (group.clicks != 0 && sessions.size() <= Attribution::mask_capacity) {
+            attribution.small(sessions, rows.clicks, group.click_end, click_end);
+        } else {
+            if (group.clicks > 1) {
+                const auto earlier = [](const TimedClick& a, const TimedClick& b) { return a.time < b.time; };
+                std::sort(rows.clicks.begin() + group.click_end, rows.clicks.begin() + click_end, earlier);
+            }
+            attribution.credit(sessions, rows.clicks, group.click_end, click_end);
+            attribution.assist(sessions, rows.clicks, group.click_end, click_end);
+        }
         sessions.clear();
     }
 }
@@ -632,14 +837,10 @@ public:
     }
 };
 
-int run(const fs::path& data, const fs::path& output, Time start, Time end, size_t ncpu) {
-    if (start == bad_time || end == bad_time || end <= start || ncpu == 0) {
-        throw std::runtime_error("invalid window or CPU count");
-    }
-    Timer timer;
-    Inputs inputs;
-    Keys keys;
-    const Catalog catalog = load_catalog(inputs, data, keys);
+template<class Layout>
+int process(const fs::path& data, const fs::path& output, Time start, Time end, size_t ncpu,
+            Inputs& inputs, Keys& keys, const Catalog& catalog, Timer& timer, const Layout& layout) {
+    using Event = typename Layout::Event;
     Links links;
     timer.stage("catalog");
 
@@ -648,17 +849,18 @@ int run(const fs::path& data, const fs::path& output, Time start, Time end, size
     load_chunks(inputs, data / "clicks", false, chunks);
     std::sort(chunks.begin(), chunks.end(), [](const Chunk& a, const Chunk& b) {
         if (a.events != b.events) return a.events;
-        return a.bytes.size() > b.bytes.size();
+        return a.size > b.size;
     });
     std::promise<void> links_built;
     const auto links_ready = links_built.get_future().share();
-    std::vector<WorkerInput> workers(ncpu);
+    std::vector<WorkerInput<Event>> workers(ncpu);
+    std::vector<ChunkReader> readers(ncpu);
     parallel(ncpu, chunks.size() + 1, [&](size_t worker, size_t task) {
         if (task == 0) {
             try {
                 std::array<Text, 2> c;
-                inputs.folder(data / "links", [&](Text bytes) {
-                    lines(bytes, [&](Text row) {
+                inputs.folder(data / "links", [&](Text bytes, const fs::path&) {
+                    lines(bytes.substr(next_line(bytes, 0)), [&](Text row) {
                         if (fields(row, c) && !c[0].empty() && !c[1].empty()) {
                             links.join(keys.encode(c[0]), keys.encode(c[1]), keys);
                         }
@@ -673,11 +875,12 @@ int run(const fs::path& data, const fs::path& output, Time start, Time end, size
             return;
         }
         const Chunk& chunk = chunks[task - 1];
+        const Text bytes = readers[worker].read(chunk);
         if (chunk.events) {
-            event_chunk(chunk.bytes, keys, catalog, workers[worker], start, end);
+            event_chunk(bytes, keys, catalog, workers[worker], start, end, layout);
         } else {
             links_ready.get();
-            click_chunk(chunk.bytes, keys, catalog, links, workers[worker], start, end);
+            click_chunk(bytes, keys, catalog, links, workers[worker], start, end);
         }
     });
     timer.stage("links and parse");
@@ -706,10 +909,12 @@ int run(const fs::path& data, const fs::path& output, Time start, Time end, size
         writers.push_back(std::make_unique<BatchWriter<3>>(user_output / ("part-" + std::to_string(worker) + ".parquet")));
         counts.emplace_back(start, end, catalog.names.size());
     }
+    const size_t time_buckets = (end - start + session_gap - 1) / session_gap;
+    const size_t bucket_count = time_buckets <= 10000 ? time_buckets : 0;
     parallel(ncpu, partitions, [&](size_t worker, size_t task) {
         const size_t part = order[task];
-        const auto rows = group_by_person(workers, part);
-        summarize(rows, keys, catalog, *writers[worker], counts[worker]);
+        auto rows = group_by_person(workers, part, bucket_count, layout);
+        summarize(rows, keys, catalog, *writers[worker], counts[worker], start, bucket_count);
     });
     parallel(ncpu, writers.size(), [&](size_t, size_t i) { writers[i]->close(); });
 
@@ -728,8 +933,24 @@ int run(const fs::path& data, const fs::path& output, Time start, Time end, size
     });
     campaigns.close();
     timer.stage("sort, aggregate, parquet");
-    return 0;
+    // All output is closed and workers are joined. The OS reclaims process-local storage.
+    std::cerr.flush();
+    std::_Exit(EXIT_SUCCESS);
 }
+int run(const fs::path& data, const fs::path& output, Time start, Time end, size_t ncpu) {
+    if (start == bad_time || end == bad_time || end <= start || ncpu == 0) {
+        throw std::runtime_error("invalid window or CPU count");
+    }
+    Timer timer;
+    Inputs inputs;
+    Keys keys;
+    const Catalog catalog = load_catalog(inputs, data, keys);
+    if (end - start - 1 <= UINT32_MAX && catalog.categories.size() <= 256) {
+        return process(data, output, start, end, ncpu, inputs, keys, catalog, timer, CompactEvents{start});
+    }
+    return process(data, output, start, end, ncpu, inputs, keys, catalog, timer, WideEvents{});
+}
+
 }
 
 int main(int argc, char** argv) {
