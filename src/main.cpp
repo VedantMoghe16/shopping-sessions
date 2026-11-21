@@ -12,6 +12,8 @@
 #include <numeric>
 #include <thread>
 #include <utility>
+#include <new>
+#include <type_traits>
 #include <nlohmann/json.hpp>
 
 extern "C" void __gcov_dump() noexcept __attribute__((weak));
@@ -304,17 +306,67 @@ struct Click {
     uint32_t campaign;
 };
 
+constexpr size_t arena_slab_bytes = 2 * 1024 * 1024;
+
+class RecordArena {
+    std::vector<char*> slabs_;
+    size_t used_ = arena_slab_bytes;
+
+public:
+    RecordArena() = default;
+    RecordArena(const RecordArena&) = delete;
+    RecordArena& operator=(const RecordArena&) = delete;
+    ~RecordArena() { release(); }
+
+    void release() {
+        for (char* slab : slabs_) munmap(slab, arena_slab_bytes);
+        slabs_.clear();
+        used_ = arena_slab_bytes;
+    }
+
+    void* allocate(size_t bytes) {
+        if (used_ + bytes > arena_slab_bytes) {
+            if (slabs_.size() == slabs_.capacity()) {
+                slabs_.reserve(std::max(size_t{4}, 2 * slabs_.capacity()));
+            }
+            void* memory = mmap(nullptr, 2 * arena_slab_bytes, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (memory == MAP_FAILED) throw std::bad_alloc();
+            const auto address = reinterpret_cast<uintptr_t>(memory);
+            const auto aligned = (address + arena_slab_bytes - 1) & ~(arena_slab_bytes - 1);
+            auto* slab = reinterpret_cast<char*>(aligned);
+            const size_t before = aligned - address;
+            if (before != 0) munmap(memory, before);
+            munmap(slab + arena_slab_bytes, arena_slab_bytes - before);
+            // The advice is optional. The arena works with ordinary pages too.
+            madvise(slab, arena_slab_bytes, MADV_HUGEPAGE);
+            slabs_.push_back(slab);
+            used_ = 0;
+        }
+        char* slice = slabs_.back() + used_;
+        used_ += bytes;
+        return slice;
+    }
+};
+
 template<class Record, size_t page_rows = 2048>
 class RecordBuffers {
-    std::vector<std::unique_ptr<Record[]>> pages_;
+    static_assert(sizeof(Record) * page_rows <= arena_slab_bytes);
+    static_assert(std::is_trivially_destructible_v<Record>);
+    std::vector<Record*> pages_;
+    RecordArena* arena_ = nullptr;
     size_t size_ = 0;
 
 public:
+    void set_arena(RecordArena& arena) { arena_ = &arena; }
     size_t size() const { return size_; }
 
     void push_back(const Record& row) {
         const size_t offset = size_ % page_rows;
-        if (offset == 0) pages_.push_back(std::unique_ptr<Record[]>(new Record[page_rows]));
+        if (offset == 0) {
+            void* memory = arena_->allocate(sizeof(Record) * page_rows);
+            pages_.push_back(::new (memory) Record[page_rows]);
+        }
         pages_.back()[offset] = row;
         ++size_;
     }
@@ -337,10 +389,16 @@ public:
 
 template<class Layout>
 struct WorkerInput {
+    RecordArena candidate_storage, event_storage;
     std::array<RecordBuffers<typename Layout::Candidate>, partitions> candidates;
     std::vector<WideEvents::Candidate> extra;
     std::array<RecordBuffers<typename Layout::Event, 512>, partitions> events;
     std::array<std::vector<Click>, partitions> clicks;
+
+    WorkerInput() {
+        for (auto& buffer : candidates) buffer.set_arena(candidate_storage);
+        for (auto& buffer : events) buffer.set_arena(event_storage);
+    }
 };
 
 struct Chunk {
@@ -967,7 +1025,10 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     parallel(ncpu, partitions, [&](size_t worker, size_t part) {
         deduplicate(part, workers, workers[worker], links, layout);
     });
-    for (auto& worker : workers) std::vector<WideEvents::Candidate>().swap(worker.extra);
+    for (auto& worker : workers) {
+        worker.candidate_storage.release();
+        std::vector<WideEvents::Candidate>().swap(worker.extra);
+    }
     timer.stage("event dedup");
 
     std::vector<size_t> order(partitions);

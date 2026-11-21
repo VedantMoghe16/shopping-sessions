@@ -232,7 +232,26 @@ bool fields(Text row, std::array<Text, N>& output) {
     return true;
 }
 
+#ifdef __AVX2__
+inline Time thirteen_digits(Text text) {
+    int64_t first, last;
+    std::memcpy(&first, text.data(), 8);
+    std::memcpy(&last, text.data() + 5, 8);
+    const auto bytes = _mm_sub_epi8(_mm_set_epi64x(last, first), _mm_set1_epi8('0'));
+    const auto ordered = _mm_xor_si128(bytes, _mm_set1_epi8(-128));
+    if (_mm_movemask_epi8(_mm_cmpgt_epi8(ordered, _mm_set1_epi8(9 - 128)))) return bad_time;
+    const auto pairs = _mm_maddubs_epi16(bytes, _mm_set1_epi16(0x010a));
+    const auto quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+    const int upper = _mm_cvtsi128_si32(quads) * 10000 + _mm_extract_epi32(quads, 1);
+    const int lower = _mm_extract_epi32(quads, 2) * 10000 + _mm_extract_epi32(quads, 3);
+    return static_cast<Time>(upper / 1000) * 100000000 + lower;
+}
+#endif
+
 inline Time digits(Text value, Time limit) {
+#ifdef __AVX2__
+    if (limit == std::numeric_limits<Time>::max() && value.size() == 13) return thirteen_digits(value);
+#endif
     if (value.empty()) return bad_time;
     Time result = 0;
     if ((limit == std::numeric_limits<Time>::max() && value.size() <= 18) ||
