@@ -14,6 +14,8 @@
 #include <utility>
 #include <nlohmann/json.hpp>
 
+extern "C" void __gcov_dump() noexcept __attribute__((weak));
+
 namespace shopping {
 constexpr size_t partitions = 256;
 constexpr size_t chunk_bytes = 4 * 1024 * 1024;
@@ -302,9 +304,8 @@ struct Click {
     uint32_t campaign;
 };
 
-template<class Record>
-class CandidateBuffers {
-    static constexpr size_t page_rows = 2048;
+template<class Record, size_t page_rows = 2048>
+class RecordBuffers {
     std::vector<std::unique_ptr<Record[]>> pages_;
     size_t size_ = 0;
 
@@ -319,7 +320,7 @@ public:
     }
 
     template<class Visit>
-    void each(Visit visit) const {
+    void each(Visit visit) {
         size_t remaining = size_;
         for (const auto& page : pages_) {
             const size_t count = std::min(page_rows, remaining);
@@ -336,9 +337,9 @@ public:
 
 template<class Layout>
 struct WorkerInput {
-    std::array<CandidateBuffers<typename Layout::Candidate>, partitions> candidates;
+    std::array<RecordBuffers<typename Layout::Candidate>, partitions> candidates;
     std::vector<WideEvents::Candidate> extra;
-    std::array<std::vector<typename Layout::Event>, partitions> events;
+    std::array<RecordBuffers<typename Layout::Event, 512>, partitions> events;
     std::array<std::vector<Click>, partitions> clicks;
 };
 
@@ -448,7 +449,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
     while (buckets < 16 * count) buckets *= 2;
     std::vector<uint64_t> seen(buckets / 64), collided(buckets / 64);
     size_t repeats = 0;
-    for (const auto& worker : workers) {
+    for (auto& worker : workers) {
         worker.candidates[part].each([&](const Record& row) {
             const size_t bucket = (row.id >> 8) & (buckets - 1);
             const uint64_t bit = uint64_t{1} << (bucket & 63);
@@ -468,7 +469,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
         event.person = links.mixed_person(event.person);
         writer.events[event.person & (partitions - 1)].push_back(event);
     };
-    for (const auto& worker : workers) {
+    for (auto& worker : workers) {
         worker.candidates[part].each([&](const Record& row) {
             const uint64_t hash = row.id >> 8;
             const size_t bucket = hash & (buckets - 1);
@@ -546,10 +547,10 @@ PersonPartition group_by_person(std::vector<WorkerInput<Layout>>& workers, size_
     PersonGroups index;
     size_t event_count = 0, click_count = 0;
     for (auto& worker : workers) {
-        for (Event& event : worker.events[part]) {
+        worker.events[part].each([&](Event& event) {
             event.person = index.add(event.person);
             ++index.groups[event.person].events;
-        }
+        });
         event_count += worker.events[part].size();
     }
     for (auto& worker : workers) {
@@ -570,11 +571,11 @@ PersonPartition group_by_person(std::vector<WorkerInput<Layout>>& workers, size_
     result.events.resize(event_count);
     result.clicks.resize(click_count);
     for (auto& worker : workers) {
-        for (const Event& event : worker.events[part]) {
+        worker.events[part].each([&](const Event& event) {
             PersonGroup& group = index.groups[event.person];
             result.events[--group.event_end] = layout.decode(event);
-        }
-        std::vector<Event>().swap(worker.events[part]);
+        });
+        worker.events[part].clear();
         for (const Click& click : worker.clicks[part]) {
             if (click.person) {
                 PersonGroup& group = index.groups[click.person - 1];
@@ -1014,6 +1015,7 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     timer.stage("sort, aggregate, parquet");
     // All output is closed and workers are joined. The OS reclaims process-local storage.
     std::cerr.flush();
+    if (__gcov_dump) __gcov_dump();
     std::_Exit(EXIT_SUCCESS);
 }
 int run(const fs::path& data, const fs::path& output, Time start, Time end, size_t ncpu) {

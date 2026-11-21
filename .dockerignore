@@ -1,5 +1,6 @@
 **
 !Dockerfile
-!requirements.txt
 !src/
 !src/**
+!tools/
+!tools/train.py
