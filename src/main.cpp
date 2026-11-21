@@ -201,10 +201,35 @@ public:
 
 };
 
+constexpr uint32_t outside_campaign_index = 10000;
+
+uint32_t campaign_number(Text name) {
+    if (name.size() < 3 || name.size() > 6 || name[0] != 'c' || name[1] != '_' ||
+        (name.size() > 3 && name[2] == '0')) return outside_campaign_index;
+    unsigned index = 0;
+    for (size_t i = 2; i < name.size(); ++i) {
+        const unsigned digit = static_cast<unsigned char>(name[i]) - static_cast<unsigned>('0');
+        if (digit > 9) return outside_campaign_index;
+        index = index * 10 + digit;
+    }
+    return index;
+}
+
 struct Catalog {
     KeyMap<uint32_t> products, campaigns, category_ids;
+    std::vector<uint32_t> numbered_campaigns;
     std::vector<Key> categories;
     std::vector<std::pair<Key, Key>> names;
+
+    uint32_t campaign(Text name, Keys& keys) const {
+        // Only canonical decimal suffixes use the direct index.
+        const uint32_t index = campaign_number(name);
+        if (index < outside_campaign_index) {
+            return index < numbered_campaigns.size() ? numbered_campaigns[index] : 0;
+        }
+        const auto found = campaigns.find(keys.encode(name));
+        return found == campaigns.end() ? 0 : found->second;
+    }
 };
 
 Catalog load_catalog(Inputs& inputs, const fs::path& data, Keys& keys) {
@@ -225,7 +250,14 @@ Catalog load_catalog(Inputs& inputs, const fs::path& data, Keys& keys) {
     inputs.dimension(data / "campaigns.csv", [&](Text row) {
         if (!fields(row, columns)) throw std::runtime_error("invalid campaign dimension");
         const Key id = keys.encode(columns[0]);
-        catalog.campaigns.emplace(id, catalog.names.size());
+        const uint32_t slot = campaign_number(columns[0]);
+        const auto campaign = static_cast<uint32_t>(catalog.names.size());
+        if (slot < outside_campaign_index) {
+            if (catalog.numbered_campaigns.size() <= slot) catalog.numbered_campaigns.resize(slot + 1);
+            if (catalog.numbered_campaigns[slot] == 0) catalog.numbered_campaigns[slot] = campaign;
+        } else {
+            catalog.campaigns.emplace(id, campaign);
+        }
         catalog.names.emplace_back(id, keys.encode(columns[1]));
     });
     return catalog;
@@ -518,10 +550,10 @@ void click_chunk(Text bytes, Keys& keys, const Catalog& catalog, const Links& li
         if (!fields(row, c) || c[0].empty() || c[1].empty() || c[2].empty()) return;
         const Time time = timestamp(c[3]);
         if (time < start - week_ms || time >= end) return;
-        const auto campaign = catalog.campaigns.find(keys.encode(c[2]));
-        if (campaign == catalog.campaigns.end()) return;
+        const uint32_t campaign = catalog.campaign(c[2], keys);
+        if (campaign == 0) return;
         const Key person = links.mixed_person(keys.encode(c[1]));
-        worker.clicks[person & (partitions - 1)].push_back({person, time, keys.encode(c[0]), campaign->second});
+        worker.clicks[person & (partitions - 1)].push_back({person, time, keys.encode(c[0]), campaign});
     });
 }
 
