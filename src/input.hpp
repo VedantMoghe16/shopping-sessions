@@ -356,9 +356,10 @@ struct DateCacheEntry {
 
 inline UtcDate utc_date(const char* p) {
     static thread_local std::array<DateCacheEntry, 128> cache;
-    const auto byte = [&](size_t i) { return static_cast<unsigned char>(p[i]); };
-    const size_t slot = (byte(8) * 10 + byte(9) +
-        byte(6) * 31 + byte(5) * 77 + byte(3) * 13) & (cache.size() - 1);
+    // Adjacent months map to different halves. Each half has a slot for every day.
+    const size_t slot = (static_cast<unsigned char>(p[9]) & 15)
+        | ((static_cast<unsigned char>(p[8]) & 3) << 4)
+        | ((static_cast<unsigned char>(p[6]) & 1) << 6);
     DateCacheEntry& entry = cache[slot];
     uint64_t prefix;
     uint16_t suffix;
