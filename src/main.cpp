@@ -85,33 +85,34 @@ class Links {
         uint32_t parent, size;
     };
     struct Entry {
-        Key id = 0, value = 0;
+        Key mixed = 0, value = 0;
     };
     std::vector<Entry> ids_ = std::vector<Entry>(1024);
     std::vector<Node> nodes_;
     std::vector<uint64_t> changed_;
 
-    static Entry& find(std::vector<Entry>& table, Key key) {
+    static Entry& find(std::vector<Entry>& table, Key mixed) {
         const size_t mask = table.size() - 1;
-        size_t slot = hash_key(key) & mask;
-        while (table[slot].id != 0 && table[slot].id != key) slot = (slot + 1) & mask;
+        size_t slot = mixed & mask;
+        while (table[slot].mixed && table[slot].mixed != mixed) slot = (slot + 1) & mask;
         return table[slot];
     }
 
     uint32_t add(Key key) {
-        Entry* entry = &find(ids_, key);
-        if (entry->id == 0) {
+        const Key mixed = hash_key(key);
+        Entry* entry = &find(ids_, mixed);
+        if (entry->mixed == 0) {
             if ((nodes_.size() + 1) * 4 > ids_.size() * 3) {
                 std::vector<Entry> larger(ids_.size() * 2);
                 for (const Entry& old : ids_) {
-                    if (old.id != 0) find(larger, old.id) = old;
+                    if (old.mixed) find(larger, old.mixed) = old;
                 }
                 ids_.swap(larger);
-                entry = &find(ids_, key);
+                entry = &find(ids_, mixed);
             }
             if (nodes_.size() == UINT32_MAX) throw std::runtime_error("too many linked IDs");
             const auto index = static_cast<uint32_t>(nodes_.size());
-            *entry = {key, index};
+            *entry = {mixed, index};
             nodes_.push_back({key, index, 1});
         }
         return static_cast<uint32_t>(entry->value);
@@ -139,10 +140,10 @@ public:
     void finish() {
         size_t aliases = 0;
         for (Entry& entry : ids_) {
-            if (entry.id == 0) continue;
+            if (entry.mixed == 0) continue;
             const Key canonical = nodes_[root(static_cast<uint32_t>(entry.value))].minimum;
-            aliases += canonical != entry.id;
             entry.value = hash_key(canonical);
+            aliases += entry.value != entry.mixed;
         }
         std::vector<Node>().swap(nodes_);
         // A clear bit proves the user is already canonical. A set bit still needs an exact lookup.
@@ -150,23 +151,26 @@ public:
         while (bits < 16 * aliases) bits *= 2;
         changed_.resize(bits / 64);
         for (const Entry& entry : ids_) {
-            if (entry.id == 0) continue;
-            const Key mixed = hash_key(entry.id);
-            if (mixed != entry.value) {
-                const size_t index = mixed & (bits - 1);
+            if (entry.mixed != entry.value) {
+                const size_t index = entry.mixed & (bits - 1);
                 changed_[index >> 6] |= uint64_t{1} << (index & 63);
             }
         }
+    }
+
+    Key changed_person(Key mixed) const {
+        // The reversible mixer preserves full key equality.
+        const size_t mask = ids_.size() - 1;
+        size_t slot = mixed & mask;
+        while (ids_[slot].mixed && ids_[slot].mixed != mixed) slot = (slot + 1) & mask;
+        return ids_[slot].mixed == mixed ? ids_[slot].value : mixed;
     }
 
     Key mixed_person(Key user) const {
         const Key mixed = hash_key(user);
         const size_t index = mixed & (changed_.size() * 64 - 1);
         if ((changed_[index >> 6] & (uint64_t{1} << (index & 63))) == 0) return mixed;
-        const size_t mask = ids_.size() - 1;
-        size_t slot = mixed & mask;
-        while (ids_[slot].id != 0 && ids_[slot].id != user) slot = (slot + 1) & mask;
-        return ids_[slot].id == user ? ids_[slot].value : mixed;
+        return changed_person(mixed);
     }
 
     template<class Row, size_t N>
@@ -174,31 +178,25 @@ public:
         static_assert(N <= 64);
         const size_t bits = changed_.size() * 64 - 1;
         const size_t mask = ids_.size() - 1;
-        std::array<Key, N> mixed;
         for (size_t i = 0; i < count; ++i) {
-            mixed[i] = hash_key(rows[i].person);
-            __builtin_prefetch(&changed_[(mixed[i] & bits) >> 6], 0, 1);
+            rows[i].person = hash_key(rows[i].person);
+            __builtin_prefetch(&changed_[(rows[i].person & bits) >> 6], 0, 1);
         }
         uint64_t pending = 0;
         for (size_t i = 0; i < count; ++i) {
-            const size_t bit = mixed[i] & bits;
+            const Key mixed = rows[i].person;
+            const size_t bit = mixed & bits;
             if ((changed_[bit >> 6] & (uint64_t{1} << (bit & 63))) != 0) {
                 pending |= uint64_t{1} << i;
-                __builtin_prefetch(&ids_[mixed[i] & mask], 0, 1);
+                __builtin_prefetch(&ids_[mixed & mask], 0, 1);
             }
         }
-        for (size_t i = 0; i < count; ++i) {
-            Key canonical = mixed[i];
-            if ((pending & (uint64_t{1} << i)) != 0) {
-                const Key key = rows[i].person;
-                size_t slot = mixed[i] & mask;
-                while (ids_[slot].id != 0 && ids_[slot].id != key) slot = (slot + 1) & mask;
-                if (ids_[slot].id == key) canonical = ids_[slot].value;
-            }
-            rows[i].person = canonical;
+        while (pending) {
+            const size_t i = __builtin_ctzll(pending);
+            rows[i].person = changed_person(rows[i].person);
+            pending &= pending - 1;
         }
     }
-
 };
 
 constexpr uint32_t outside_campaign_index = 10000;

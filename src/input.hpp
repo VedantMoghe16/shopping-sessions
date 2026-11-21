@@ -132,6 +132,14 @@ public:
 
     bool less(Key a, Key b) {
         if (((a | b) & wide) == 0) return a < b;
+        if ((a & b & raw_suffix) == raw_suffix) {
+            if ((a ^ b) & user_prefix) return (a & user_prefix) == 0;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            return __builtin_bswap64(a) < __builtin_bswap64(b);
+#else
+            return a < b;
+#endif
+        }
         char a_buffer[9], b_buffer[9];
         return text(a, a_buffer).compare(text(b, b_buffer)) < 0;
     }
