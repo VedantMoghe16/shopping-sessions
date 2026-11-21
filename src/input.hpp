@@ -341,31 +341,87 @@ inline Time civil_days(int year, int month, int day) {
     return era * 146097 + y * 365 + y / 4 - y / 100 + (153 * m + 2) / 5 + day - 1 - 719468;
 }
 
+struct UtcDate {
+    Time seconds = bad_time;
+    int32_t day = 0;
+};
+
 struct DateCacheEntry {
     uint64_t prefix = 0;
     uint16_t suffix = 0;
+    int32_t day = 0;
     Time seconds = bad_time;
 };
 
-inline Time date_start(const char* p) {
+inline UtcDate utc_date(const char* p) {
     static thread_local std::array<DateCacheEntry, 128> cache;
     uint64_t prefix;
     uint16_t suffix;
     std::memcpy(&prefix, p, 8);
     std::memcpy(&suffix, p + 8, 2);
     const auto byte = [&](size_t i) { return static_cast<unsigned char>(p[i]); };
-    DateCacheEntry& entry = cache[(byte(8) * 10 + byte(9) +
-        byte(6) * 31 + byte(5) * 77 + byte(3) * 13) & (cache.size() - 1)];
-    if (entry.prefix == prefix && entry.suffix == suffix) return entry.seconds;
+    const size_t slot = (byte(8) * 10 + byte(9) +
+        byte(6) * 31 + byte(5) * 77 + byte(3) * 13) & (cache.size() - 1);
+    DateCacheEntry& entry = cache[slot];
+    if (entry.prefix == prefix && entry.suffix == suffix) return {entry.seconds, entry.day};
+    if (p[4] != '-' || p[7] != '-') return {};
 
     const int year = fixed_digits(p, 4), month = fixed_digits(p + 5, 2);
     const int day = fixed_digits(p + 8, 2);
-    if (year < 0 || month < 1 || month > 12 || day < 1) return bad_time;
+    if (year < 0 || month < 1 || month > 12 || day < 1) return {};
     static constexpr int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     const bool leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (day > month_days[month - 1] + leap) return bad_time;
-    entry = {prefix, suffix, civil_days(year, month, day) * (day_ms / 1000)};
-    return entry.seconds;
+    if (day > month_days[month - 1] + leap) return {};
+    const auto epoch = static_cast<int32_t>(civil_days(year, month, day));
+    entry = {prefix, suffix, epoch, epoch * (day_ms / 1000)};
+    return {entry.seconds, entry.day};
+}
+
+constexpr unsigned ingest_clock_bits = 24;
+constexpr int32_t ingest_day_bias = 1 << 20;
+
+struct IngestClock {
+    uint64_t order = 0;
+    Time midnight_ms = 0;
+
+    bool timely(Time event) const {
+        if (midnight_ms <= event) return true;
+        const Time deadline = event + day_ms;
+        if (midnight_ms > deadline) return false;
+        const auto pair = [&](unsigned shift) {
+            return 10 * ((order >> (shift + 4)) & 15) + ((order >> shift) & 15);
+        };
+        const auto second = 3600 * pair(16) + 60 * pair(8) + pair(0);
+        return midnight_ms + static_cast<Time>(second) * 1000 <= deadline;
+    }
+};
+
+inline IngestClock ingest_clock(Text value) {
+    if (value.size() != 20 || value[10] != 'T' || value[19] != 'Z') return {};
+    const char* p = value.data();
+    uint32_t clock;
+#ifdef __BMI2__
+    uint64_t word;
+    std::memcpy(&word, p + 11, sizeof(word));
+    word = __builtin_bswap64(word);
+    constexpr uint64_t digits = UINT64_C(0x0f0f000f0f000f0f);
+    if ((word & ~digits) != UINT64_C(0x30303a30303a3030) ||
+        (((word & digits) + UINT64_C(0x0606000606000606)) & UINT64_C(0x1010001010001010))) return {};
+    clock = static_cast<uint32_t>(_pext_u64(word, digits));
+    if ((clock >> 16) > 0x23 || ((clock >> 8) & 255) > 0x59 || (clock & 255) > 0x59) return {};
+#else
+    if (p[13] != ':' || p[16] != ':') return {};
+    const int hours = fixed_digits(p + 11, 2);
+    const int minutes = fixed_digits(p + 14, 2);
+    const int seconds = fixed_digits(p + 17, 2);
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) return {};
+    const auto bcd = [](unsigned n) { return ((n / 10) << 4) | (n % 10); };
+    clock = (bcd(hours) << 16) | (bcd(minutes) << 8) | bcd(seconds);
+#endif
+    const UtcDate date = utc_date(p);
+    if (date.seconds == bad_time) return {};
+    return {(static_cast<uint64_t>(date.day + ingest_day_bias) << ingest_clock_bits) | clock,
+            date.seconds * 1000};
 }
 
 template<bool Seconds = false>
@@ -377,10 +433,9 @@ inline Time timestamp(Text value, bool utc_only = false) {
     if (!f1 && !f2) {
         return utc_only ? bad_time : digits(value, std::numeric_limits<Time>::max());
     }
-    if (value[4] != '-' || value[7] != '-' || value[10] != 'T' ||
-        value[13] != ':' || value[16] != ':') return bad_time;
+    if (value[10] != 'T' || value[13] != ':' || value[16] != ':') return bad_time;
     const char* p = value.data();
-    const Time start = date_start(p);
+    const Time start = utc_date(p).seconds;
     const int hour = fixed_digits(p + 11, 2), minute = fixed_digits(p + 14, 2);
     const int second = fixed_digits(p + 17, 2);
     if (start == bad_time || hour < 0 || hour > 23 ||

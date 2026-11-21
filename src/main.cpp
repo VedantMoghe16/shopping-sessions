@@ -250,16 +250,16 @@ struct WideEvents {
 
     struct Candidate {
         Key id;
-        Time ingest;
+        uint64_t ingest;
         Event event;
     };
 
-    Candidate candidate(Key id, Time ingest, Event event, std::vector<Candidate>&, size_t) const {
+    Candidate candidate(Key id, uint64_t ingest, Event event, std::vector<Candidate>&, size_t) const {
         return {id, ingest, event};
     }
 
     template<class Workers>
-    Time ingest(const Candidate& row, const Workers&) const { return row.ingest; }
+    uint64_t ingest(const Candidate& row, const Workers&) const { return row.ingest; }
 
     template<class Workers>
     Event event(const Candidate& row, const Workers&) const { return row.event; }
@@ -275,7 +275,7 @@ struct CompactEvents {
     };
 
     Time start;
-    Time ingest_base;
+    uint64_t ingest_base;
 
     Event make(Key person, Time time, uint32_t cents, uint32_t category) const {
         return {person, static_cast<uint32_t>(time - start), (category << price_bits) | cents};
@@ -294,11 +294,11 @@ struct CompactEvents {
     static constexpr uint64_t extra_index_mask = (uint64_t{1} << 48) - 1;
     static constexpr uint64_t time_mask = (uint64_t{1} << 31) - 1;
 
-    Candidate candidate(Key id, Time ingest, Event event, std::vector<WideEvents::Candidate>& extra, size_t worker) const {
-        const auto seconds = static_cast<uint64_t>(ingest - ingest_base);
-        // Purchases and out-of-range ingest times keep their full values in side records.
-        if (event.purchase == 0 && seconds <= UINT32_MAX) {
-            return {id, event.person, (seconds << 31) | event.offset};
+    Candidate candidate(Key id, uint64_t ingest, Event event, std::vector<WideEvents::Candidate>& extra, size_t worker) const {
+        const uint64_t clock = ingest - ingest_base;
+        // The relative day and clock use 32 bits. Side records keep absolute keys.
+        if (event.purchase == 0 && clock <= UINT32_MAX) {
+            return {id, event.person, (clock << 31) | event.offset};
         }
         if (extra.size() > extra_index_mask) throw std::runtime_error("too many indirect events");
         const uint64_t pointer = indirect | (static_cast<uint64_t>(worker) << 48) | extra.size();
@@ -313,9 +313,9 @@ struct CompactEvents {
     }
 
     template<class Workers>
-    Time ingest(const Candidate& row, const Workers& workers) const {
+    uint64_t ingest(const Candidate& row, const Workers& workers) const {
         if (row.packed & indirect) return extra(row, workers).ingest;
-        return ingest_base + static_cast<Time>(row.packed >> 31);
+        return ingest_base + (row.packed >> 31);
     }
 
     template<class Workers>
@@ -488,13 +488,13 @@ void event_chunk(Text bytes, Keys& keys, const Catalog& catalog,
         if (!fields(row, c) || c[0].empty()) return;
         // The mixer is a bijection, so its result remains an exact event key.
         const Key id = hash_key(keys.encode(c[0]));
-        const Time ingest = timestamp<true>(c[3]);
-        if (ingest == bad_time) throw std::runtime_error("invalid guaranteed ingest_ts");
+        const IngestClock ingest = ingest_clock(c[3]);
+        if (ingest.order == 0) throw std::runtime_error("invalid guaranteed ingest_ts");
         typename Layout::Event event{};
         const Time time = timestamp(c[2]);
         const bool purchase = c[4] == "purchase";
         if (!c[1].empty() && !c[5].empty() && (purchase || c[4] == "view" || c[4] == "cart")
-            && time >= start && time < end && ingest * 1000 - time <= day_ms) {
+            && time >= start && time < end && ingest.timely(time)) {
             const Time price = purchase ? digits(c[6], 10000000) : 0;
             if (!purchase || price > 0) {
                 uint32_t category = 0;
@@ -506,7 +506,7 @@ void event_chunk(Text bytes, Keys& keys, const Catalog& catalog,
             }
         }
         worker.candidates[id & (partitions - 1)].push_back(
-            layout.candidate(id, ingest, event, worker.extra, worker_id));
+            layout.candidate(id, ingest.order, event, worker.extra, worker_id));
     });
 }
 
@@ -1129,7 +1129,8 @@ int run(const fs::path& data, const fs::path& output, Time start, Time end, size
     Keys keys;
     const Catalog catalog = load_catalog(inputs, data, keys);
     if (end - start - 1 <= INT32_MAX && catalog.categories.size() <= 256 && ncpu <= 32768) {
-        return process(data, output, start, end, ncpu, inputs, keys, catalog, timer, CompactEvents{start, start / 1000 - (int64_t{1} << 31)});
+        const uint64_t compact_base = static_cast<uint64_t>(epoch_day(start) + ingest_day_bias - 64) << ingest_clock_bits;
+        return process(data, output, start, end, ncpu, inputs, keys, catalog, timer, CompactEvents{start, compact_base});
     }
     return process(data, output, start, end, ncpu, inputs, keys, catalog, timer, WideEvents{});
 }
