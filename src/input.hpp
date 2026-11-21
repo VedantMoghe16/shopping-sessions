@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__AVX2__) || defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
 namespace shopping {
 namespace fs = std::filesystem;
 using Text = std::string_view;
@@ -60,6 +64,18 @@ class Keys {
 
 public:
     Key encode(Text text) {
+#ifdef __BMI2__
+        if (text.size() == 9) {
+            uint64_t leading;
+            std::memcpy(&leading, text.data(), 8);
+            const auto last = static_cast<unsigned char>(text[8]);
+            constexpr uint64_t highs = UINT64_C(0x8080808080808080);
+            constexpr uint64_t ones = UINT64_C(0x0101010101010101);
+            if (((leading | (leading - ones)) & highs) == 0 && last != 0 && last < 128) {
+                return (_pext_u64(__builtin_bswap64(leading), ~highs) << 7) | last;
+            }
+        }
+#endif
         if (text.size() <= 9) {
             Key key = 0;
             size_t index = 0;
@@ -141,8 +157,52 @@ void lines(Text bytes, Visit visit) {
     }
 }
 
+#ifdef __AVX2__
+using DelimiterMask = __uint128_t;
+
+inline size_t first_bit(DelimiterMask mask) {
+    const auto low = static_cast<uint64_t>(mask);
+    return low ? __builtin_ctzll(low) : 64 + __builtin_ctzll(static_cast<uint64_t>(mask >> 64));
+}
+
+template<size_t N>
+bool fields_simd(Text row, std::array<Text, N>& output) {
+    const auto comma_bytes = _mm256_set1_epi8(',');
+    const auto quote_bytes = _mm256_set1_epi8('"');
+    DelimiterMask commas = 0, quotes = 0;
+    size_t position = 0;
+    for (; position < row.size(); position += 32) {
+        const size_t load_at = std::min(position, row.size() - 32);
+        const unsigned skip = position - load_at;
+        const auto block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row.data() + load_at));
+        const uint32_t comma_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, comma_bytes));
+        const uint32_t quote_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, quote_bytes));
+        commas |= DelimiterMask(comma_mask >> skip) << position;
+        quotes |= DelimiterMask(quote_mask >> skip) << position;
+    }
+    size_t begin = 0;
+    DelimiterMask outer_quotes = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if ((commas == 0) != (i == N - 1)) return false;
+        const size_t end = commas ? first_bit(commas) : row.size();
+        commas &= commas - 1;
+        if (end - begin >= 2 && row[begin] == '"' && row[end - 1] == '"') {
+            outer_quotes |= (DelimiterMask{1} << begin) | (DelimiterMask{1} << (end - 1));
+            output[i] = row.substr(begin + 1, end - begin - 2);
+        } else {
+            output[i] = row.substr(begin, end - begin);
+        }
+        begin = end + 1;
+    }
+    return quotes == outer_quotes;
+}
+#endif
+
 template<size_t N>
 bool fields(Text row, std::array<Text, N>& output) {
+#ifdef __AVX2__
+    if (row.size() >= 32 && row.size() <= 128) return fields_simd(row, output);
+#endif
     for (size_t i = 0; i < N; ++i) {
         const size_t comma = row.find(',');
         if ((comma == Text::npos) != (i == N - 1)) return false;
@@ -162,6 +222,15 @@ bool fields(Text row, std::array<Text, N>& output) {
 inline Time digits(Text value, Time limit) {
     if (value.empty()) return bad_time;
     Time result = 0;
+    if ((limit == std::numeric_limits<Time>::max() && value.size() <= 18) ||
+        (limit == 10000000 && value.size() <= 7)) {
+        for (unsigned char byte : value) {
+            const unsigned digit = byte - static_cast<unsigned>('0');
+            if (digit > 9) return bad_time;
+            result = result * 10 + digit;
+        }
+        return result;
+    }
     const Time max_prefix = limit / 10;
     const int max_last = limit % 10;
     for (unsigned char byte : value) {
@@ -191,6 +260,33 @@ inline Time civil_days(int year, int month, int day) {
     return era * 146097 + y * 365 + y / 4 - y / 100 + (153 * m + 2) / 5 + day - 1 - 719468;
 }
 
+struct DateCacheEntry {
+    uint64_t prefix = 0;
+    uint16_t suffix = 0;
+    Time milliseconds = bad_time;
+};
+
+inline Time date_start(const char* p) {
+    static thread_local std::array<DateCacheEntry, 128> cache;
+    uint64_t prefix;
+    uint16_t suffix;
+    std::memcpy(&prefix, p, 8);
+    std::memcpy(&suffix, p + 8, 2);
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(p[i]); };
+    DateCacheEntry& entry = cache[(byte(8) * 10 + byte(9) +
+        byte(6) * 31 + byte(5) * 77 + byte(3) * 13) & (cache.size() - 1)];
+    if (entry.prefix == prefix && entry.suffix == suffix) return entry.milliseconds;
+
+    const int year = fixed_digits(p, 4), month = fixed_digits(p + 5, 2);
+    const int day = fixed_digits(p + 8, 2);
+    if (year < 0 || month < 1 || month > 12 || day < 1) return bad_time;
+    static constexpr int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const bool leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if (day > month_days[month - 1] + leap) return bad_time;
+    entry = {prefix, suffix, civil_days(year, month, day) * day_ms};
+    return entry.milliseconds;
+}
+
 inline Time timestamp(Text value, bool utc_only = false) {
     const size_t size = value.size();
     const bool f1 = size == 20 && value[19] == 'Z';
@@ -201,21 +297,18 @@ inline Time timestamp(Text value, bool utc_only = false) {
     if (value[4] != '-' || value[7] != '-' || value[10] != 'T' ||
         value[13] != ':' || value[16] != ':') return bad_time;
     const char* p = value.data();
-    const int year = fixed_digits(p, 4), month = fixed_digits(p + 5, 2);
-    const int day = fixed_digits(p + 8, 2), hour = fixed_digits(p + 11, 2);
-    const int minute = fixed_digits(p + 14, 2), second = fixed_digits(p + 17, 2);
-    if (year < 0 || month < 1 || month > 12 || day < 1 ||
-        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return bad_time;
-    static constexpr int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    const bool leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (day > month_days[month - 1] + leap) return bad_time;
+    const Time start = date_start(p);
+    const int hour = fixed_digits(p + 11, 2), minute = fixed_digits(p + 14, 2);
+    const int second = fixed_digits(p + 17, 2);
+    if (start == bad_time || hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59 || second < 0 || second > 59) return bad_time;
     int offset = 0;
     if (f2) {
         const int h = fixed_digits(p + 20, 2), m = fixed_digits(p + 23, 2);
         if (p[22] != ':' || h < 0 || h > 23 || m < 0 || m > 59) return bad_time;
         offset = (h * 60 + m) * (p[19] == '-' ? -1 : 1);
     }
-    return civil_days(year, month, day) * day_ms + ((hour * 60 + minute - offset) * 60 + second) * Time{1000};
+    return start + ((hour * 60 + minute - offset) * 60 + second) * Time{1000};
 }
 
 inline int32_t epoch_day(Time time) {

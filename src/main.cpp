@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -66,19 +67,42 @@ struct Inputs {
 
 class Links {
     struct Node {
-        size_t parent, size;
         Key minimum;
+        uint32_t parent, size;
     };
-    KeyMap<size_t> ids_;
+    struct Entry {
+        Key id = 0, value = 0;
+    };
+    std::vector<Entry> ids_ = std::vector<Entry>(1024);
     std::vector<Node> nodes_;
 
-    size_t add(Key key) {
-        const auto entry = ids_.try_emplace(key, nodes_.size());
-        if (entry.second) nodes_.push_back({entry.first->second, 1, key});
-        return entry.first->second;
+    static Entry& find(std::vector<Entry>& table, Key key) {
+        const size_t mask = table.size() - 1;
+        size_t slot = hash_key(key) & mask;
+        while (table[slot].id != 0 && table[slot].id != key) slot = (slot + 1) & mask;
+        return table[slot];
     }
 
-    size_t root(size_t index) {
+    uint32_t add(Key key) {
+        Entry* entry = &find(ids_, key);
+        if (entry->id == 0) {
+            if ((nodes_.size() + 1) * 4 > ids_.size() * 3) {
+                std::vector<Entry> larger(ids_.size() * 2);
+                for (const Entry& old : ids_) {
+                    if (old.id != 0) find(larger, old.id) = old;
+                }
+                ids_.swap(larger);
+                entry = &find(ids_, key);
+            }
+            if (nodes_.size() == UINT32_MAX) throw std::runtime_error("too many linked IDs");
+            const auto index = static_cast<uint32_t>(nodes_.size());
+            *entry = {key, index};
+            nodes_.push_back({key, index, 1});
+        }
+        return static_cast<uint32_t>(entry->value);
+    }
+
+    uint32_t root(uint32_t index) {
         while (index != nodes_[index].parent) {
             nodes_[index].parent = nodes_[nodes_[index].parent].parent;
             index = nodes_[index].parent;
@@ -87,11 +111,9 @@ class Links {
     }
 
 public:
-    KeyMap<Key> canonical;
-
     void join(Key a, Key b, Keys& keys) {
-        size_t x = root(add(a));
-        size_t y = root(add(b));
+        uint32_t x = root(add(a));
+        uint32_t y = root(add(b));
         if (x == y) return;
         if (nodes_[x].size < nodes_[y].size) std::swap(x, y);
         nodes_[y].parent = x;
@@ -100,18 +122,18 @@ public:
     }
 
     void finish() {
-        canonical.reserve(ids_.size());
-        for (const auto& pair : ids_) {
-            const Key minimum = nodes_[root(pair.second)].minimum;
-            if (pair.first != minimum) canonical.emplace(pair.first, minimum);
+        // Reuse the ID index as the read-only canonical lookup after union-find.
+        for (Entry& entry : ids_) {
+            if (entry.id != 0) entry.value = nodes_[root(static_cast<uint32_t>(entry.value))].minimum;
         }
-        KeyMap<size_t>().swap(ids_);
         std::vector<Node>().swap(nodes_);
     }
 
     Key person(Key user) const {
-        const auto entry = canonical.find(user);
-        return entry == canonical.end() ? user : entry->second;
+        const size_t mask = ids_.size() - 1;
+        size_t slot = hash_key(user) & mask;
+        while (ids_[slot].id != 0 && ids_[slot].id != user) slot = (slot + 1) & mask;
+        return ids_[slot].id == user ? ids_[slot].value : user;
     }
 };
 
@@ -230,42 +252,150 @@ void deduplicate(size_t part, std::vector<WorkerInput>& workers, WorkerInput& wr
     size_t count = 0;
     for (const auto& worker : workers) count += worker.candidates[part].size();
     if (!count) return;
-    size_t slots = 1;
-    while (slots < count + count / 2 + 1) slots *= 2;
-    std::vector<const Candidate*> winners(slots, nullptr);
+    size_t buckets = 64;
+    while (buckets < 16 * count) buckets *= 2;
+    std::vector<uint64_t> seen(buckets / 64), collided(buckets / 64);
+    size_t repeats = 0;
     for (const auto& worker : workers) {
-        for (const auto& candidate : worker.candidates[part]) {
-            size_t i = (hash_key(candidate.id) >> 8) & (slots - 1);
-            while (winners[i] && winners[i]->id != candidate.id) i = (i + 1) & (slots - 1);
-            if (!winners[i] || candidate.ingest < winners[i]->ingest) winners[i] = &candidate;
+        for (const auto& row : worker.candidates[part]) {
+            const size_t bucket = (hash_key(row.id) >> 8) & (buckets - 1);
+            const uint64_t bit = uint64_t{1} << (bucket & 63);
+            const size_t word = bucket >> 6;
+            const uint64_t hit = seen[word] & bit;
+            repeats += hit != 0;
+            collided[word] |= hit;
+            seen[word] |= bit;
+        }
+    }
+    size_t slots = 1;
+    // Every collided bucket contains at most twice its number of repeat visits.
+    while (slots < repeats * 3 + 1) slots *= 2;
+    std::vector<const Candidate*> winners(slots, nullptr);
+    auto emit = [&](Event event) {
+        if (event.time == bad_time) return;
+        event.person = links.person(event.person);
+        writer.events[partition(event.person)].push_back(event);
+    };
+    for (const auto& worker : workers) {
+        for (const auto& row : worker.candidates[part]) {
+            const uint64_t hash = hash_key(row.id) >> 8;
+            const size_t bucket = hash & (buckets - 1);
+            if ((collided[bucket >> 6] & (uint64_t{1} << (bucket & 63))) == 0) {
+                emit(row.event);
+            } else {
+                size_t i = hash & (slots - 1);
+                while (winners[i] && winners[i]->id != row.id) i = (i + 1) & (slots - 1);
+                if (!winners[i] || row.ingest < winners[i]->ingest) winners[i] = &row;
+            }
         }
     }
     for (const Candidate* winner : winners) {
-        if (winner && winner->event.time != bad_time) {
-            Event event = winner->event;
-            event.person = links.person(event.person);
-            writer.events[partition(event.person)].push_back(event);
-        }
+        if (winner) emit(winner->event);
     }
     for (auto& worker : workers) std::vector<Candidate>().swap(worker.candidates[part]);
 }
 
-template<class Record>
-std::vector<Record> gather(std::vector<WorkerInput>& workers, size_t part,
-                           std::array<std::vector<Record>, partitions> WorkerInput::*member) {
-    size_t count = 0;
-    for (const auto& worker : workers) count += (worker.*member)[part].size();
-    std::vector<Record> rows;
-    rows.reserve(count);
-    for (auto& worker : workers) {
-        auto& local = (worker.*member)[part];
-        rows.insert(rows.end(), local.begin(), local.end());
-        std::vector<Record>().swap(local);
+struct PersonGroup {
+    Key person;
+    size_t events = 0, clicks = 0, event_end = 0, click_end = 0;
+};
+
+class PersonGroups {
+    std::vector<uint32_t> slots_ = std::vector<uint32_t>(256);
+
+    size_t slot(Key person) const {
+        const size_t mask = slots_.size() - 1;
+        size_t index = (hash_key(person) >> 8) & mask;
+        while (slots_[index] != 0 && groups[slots_[index] - 1].person != person) {
+            index = (index + 1) & mask;
+        }
+        return index;
     }
-    std::sort(rows.begin(), rows.end(), [](const Record& a, const Record& b) {
-        return a.person == b.person ? a.time < b.time : a.person < b.person;
+
+public:
+    std::vector<PersonGroup> groups;
+
+    uint32_t add(Key person) {
+        size_t index = slot(person);
+        if (!slots_[index]) {
+            if ((groups.size() + 1) * 4 > slots_.size() * 3) {
+                slots_.assign(slots_.size() * 2, 0);
+                for (size_t i = 0; i < groups.size(); ++i) {
+                    slots_[slot(groups[i].person)] = i + 1;
+                }
+                index = slot(person);
+            }
+            groups.push_back({person});
+            slots_[index] = groups.size();
+        }
+        return slots_[index] - 1;
+    }
+
+    uint32_t lookup(Key person) const { return slots_[slot(person)]; }
+};
+
+struct PersonPartition {
+    std::vector<Event> events;
+    std::vector<Click> clicks;
+};
+
+PersonPartition group_by_person(std::vector<WorkerInput>& workers, size_t part) {
+    PersonGroups index;
+    size_t event_count = 0, click_count = 0;
+    for (auto& worker : workers) {
+        for (Event& event : worker.events[part]) {
+            event.person = index.add(event.person);
+            ++index.groups[event.person].events;
+        }
+        event_count += worker.events[part].size();
+    }
+    for (auto& worker : workers) {
+        for (Click& click : worker.clicks[part]) {
+            click.person = index.lookup(click.person);
+            if (click.person) {
+                ++index.groups[click.person - 1].clicks;
+                ++click_count;
+            }
+        }
+    }
+    std::vector<uint32_t> order(index.groups.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](uint32_t left, uint32_t right) {
+        return index.groups[left].person < index.groups[right].person;
     });
-    return rows;
+    size_t event_offset = 0, click_offset = 0;
+    for (uint32_t group_id : order) {
+        PersonGroup& group = index.groups[group_id];
+        group.event_end = event_offset += group.events;
+        group.click_end = click_offset += group.clicks;
+    }
+    PersonPartition result;
+    result.events.resize(event_count);
+    result.clicks.resize(click_count);
+    for (auto& worker : workers) {
+        for (Event event : worker.events[part]) {
+            PersonGroup& group = index.groups[event.person];
+            event.person = group.person;
+            result.events[--group.event_end] = event;
+        }
+        std::vector<Event>().swap(worker.events[part]);
+        for (Click click : worker.clicks[part]) {
+            if (click.person) {
+                PersonGroup& group = index.groups[click.person - 1];
+                click.person = group.person;
+                result.clicks[--group.click_end] = click;
+            }
+        }
+        std::vector<Click>().swap(worker.clicks[part]);
+    }
+    const auto earlier = [](const auto& a, const auto& b) { return a.time < b.time; };
+    for (const PersonGroup& group : index.groups) {
+        auto e = result.events.begin() + group.event_end;
+        auto c = result.clicks.begin() + group.click_end;
+        if (group.events > 1) std::sort(e, e + group.events, earlier);
+        if (group.clicks > 1) std::sort(c, c + group.clicks, earlier);
+    }
+    return result;
 }
 
 struct Totals {
@@ -471,30 +601,46 @@ int run(const fs::path& data, const fs::path& scratch, Time start, Time end, siz
     Keys keys;
     const Catalog catalog = load_catalog(inputs, data, keys);
     Links links;
-    std::array<Text, 2> c;
-    inputs.folder(data / "links", [&](Text bytes) {
-        lines(bytes, [&](Text row) {
-            if (fields(row, c) && !c[0].empty() && !c[1].empty()) {
-                links.join(keys.encode(c[0]), keys.encode(c[1]), keys);
-            }
-        });
-    });
-    links.finish();
-    timer.stage("catalog and links");
+    timer.stage("catalog");
 
     std::vector<Chunk> chunks;
     load_chunks(inputs, data / "events", true, chunks);
     load_chunks(inputs, data / "clicks", false, chunks);
     std::sort(chunks.begin(), chunks.end(), [](const Chunk& a, const Chunk& b) {
+        if (a.events != b.events) return a.events;
         return a.bytes.size() > b.bytes.size();
     });
+    std::promise<void> links_built;
+    const auto links_ready = links_built.get_future().share();
     std::vector<WorkerInput> workers(ncpu);
-    parallel(ncpu, chunks.size(), [&](size_t worker, size_t task) {
-        const Chunk& chunk = chunks[task];
-        if (chunk.events) event_chunk(chunk.bytes, keys, catalog, workers[worker], start, end);
-        else click_chunk(chunk.bytes, keys, catalog, links, workers[worker], start, end);
+    parallel(ncpu, chunks.size() + 1, [&](size_t worker, size_t task) {
+        if (task == 0) {
+            try {
+                std::array<Text, 2> c;
+                inputs.folder(data / "links", [&](Text bytes) {
+                    lines(bytes, [&](Text row) {
+                        if (fields(row, c) && !c[0].empty() && !c[1].empty()) {
+                            links.join(keys.encode(c[0]), keys.encode(c[1]), keys);
+                        }
+                    });
+                });
+                links.finish();
+                links_built.set_value();
+            } catch (...) {
+                links_built.set_exception(std::current_exception());
+                throw;
+            }
+            return;
+        }
+        const Chunk& chunk = chunks[task - 1];
+        if (chunk.events) {
+            event_chunk(chunk.bytes, keys, catalog, workers[worker], start, end);
+        } else {
+            links_ready.get();
+            click_chunk(chunk.bytes, keys, catalog, links, workers[worker], start, end);
+        }
     });
-    timer.stage("parse");
+    timer.stage("links and parse");
 
     parallel(ncpu, partitions, [&](size_t worker, size_t part) {
         deduplicate(part, workers, workers[worker], links);
@@ -518,13 +664,8 @@ int run(const fs::path& data, const fs::path& scratch, Time start, Time end, siz
     }
     parallel(ncpu, partitions, [&](size_t worker, size_t task) {
         const size_t part = order[task];
-        const auto events = gather(workers, part, &WorkerInput::events);
-        if (events.empty()) {
-            for (auto& source : workers) std::vector<Click>().swap(source.clicks[part]);
-            return;
-        }
-        const auto clicks = gather(workers, part, &WorkerInput::clicks);
-        summarize(events, clicks, keys, catalog, *writers[worker], counts[worker]);
+        const auto rows = group_by_person(workers, part);
+        summarize(rows.events, rows.clicks, keys, catalog, *writers[worker], counts[worker]);
     });
     for (auto& writer : writers) writer->close();
 

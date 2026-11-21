@@ -4,7 +4,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY src/ ./
-RUN g++ -std=c++17 -O3 -DNDEBUG -pthread main.cpp -o /shopping-native
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = amd64 ]; then set -- -march=x86-64-v3; else set --; fi && g++ "$@" -std=c++17 -O3 -DNDEBUG -pthread main.cpp -o /shopping-native
 
 FROM python:3.12-slim-bookworm
 WORKDIR /app
