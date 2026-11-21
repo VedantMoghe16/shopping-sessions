@@ -169,6 +169,36 @@ public:
         return ids_[slot].id == user ? ids_[slot].value : mixed;
     }
 
+    template<class Row, size_t N>
+    void resolve_batch(std::array<Row, N>& rows, size_t count) const {
+        static_assert(N <= 64);
+        const size_t bits = changed_.size() * 64 - 1;
+        const size_t mask = ids_.size() - 1;
+        std::array<Key, N> mixed;
+        for (size_t i = 0; i < count; ++i) {
+            mixed[i] = hash_key(rows[i].person);
+            __builtin_prefetch(&changed_[(mixed[i] & bits) >> 6], 0, 1);
+        }
+        uint64_t pending = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t bit = mixed[i] & bits;
+            if ((changed_[bit >> 6] & (uint64_t{1} << (bit & 63))) != 0) {
+                pending |= uint64_t{1} << i;
+                __builtin_prefetch(&ids_[mixed[i] & mask], 0, 1);
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            Key canonical = mixed[i];
+            if ((pending & (uint64_t{1} << i)) != 0) {
+                const Key key = rows[i].person;
+                size_t slot = mixed[i] & mask;
+                while (ids_[slot].id != 0 && ids_[slot].id != key) slot = (slot + 1) & mask;
+                if (ids_[slot].id == key) canonical = ids_[slot].value;
+            }
+            rows[i].person = canonical;
+        }
+    }
+
 };
 
 struct Catalog {
@@ -522,10 +552,20 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
     // Every collided bucket contains at most twice its number of repeat visits.
     while (slots < repeats * 3 + 1) slots *= 2;
     std::vector<const Record*> winners(slots, nullptr);
+    std::array<Event, 32> pending;
+    size_t pending_count = 0;
+    auto flush = [&] {
+        links.resolve_batch(pending, pending_count);
+        for (size_t i = 0; i < pending_count; ++i) {
+            const Event& event = pending[i];
+            writer.events[event.person & (partitions - 1)].push_back(event);
+        }
+        pending_count = 0;
+    };
     auto emit = [&](Event event) {
         if (event.person == 0) return;
-        event.person = links.mixed_person(event.person);
-        writer.events[event.person & (partitions - 1)].push_back(event);
+        pending[pending_count++] = event;
+        if (pending_count == pending.size()) flush();
     };
     for (auto& worker : workers) {
         worker.candidates[part].each([&](const Record& row) {
@@ -543,6 +583,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
     for (const Record* winner : winners) {
         if (winner) emit(layout.event(*winner, workers));
     }
+    if (pending_count) flush();
     for (auto& worker : workers) worker.candidates[part].clear();
 }
 
