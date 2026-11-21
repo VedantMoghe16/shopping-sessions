@@ -16,7 +16,7 @@
 #include <type_traits>
 #include <nlohmann/json.hpp>
 
-extern "C" void __gcov_dump() noexcept __attribute__((weak));
+extern "C" int __llvm_profile_write_file() noexcept __attribute__((weak));
 
 namespace shopping {
 constexpr size_t partitions = 256;
@@ -1076,7 +1076,7 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     timer.stage("sort, aggregate, parquet");
     // All output is closed and workers are joined. The OS reclaims process-local storage.
     std::cerr.flush();
-    if (__gcov_dump) __gcov_dump();
+    if (__llvm_profile_write_file) __llvm_profile_write_file();
     std::_Exit(EXIT_SUCCESS);
 }
 int run(const fs::path& data, const fs::path& output, Time start, Time end, size_t ncpu) {
