@@ -41,6 +41,14 @@ inline uint64_t hash_key(uint64_t key) {
     return key ^ (key >> 31);
 }
 
+inline Key unmix_key(uint64_t key) {
+    key ^= (key >> 31) ^ (key >> 62);
+    key *= UINT64_C(0x319642b2d24d8ec3);
+    key ^= (key >> 27) ^ (key >> 54);
+    key *= UINT64_C(0x96de1b173f119089);
+    return key ^ (key >> 30) ^ (key >> 60);
+}
+
 struct KeyHash {
     size_t operator()(Key key) const { return hash_key(key); }
 };
@@ -268,7 +276,7 @@ inline Time civil_days(int year, int month, int day) {
 struct DateCacheEntry {
     uint64_t prefix = 0;
     uint16_t suffix = 0;
-    Time milliseconds = bad_time;
+    Time seconds = bad_time;
 };
 
 inline Time date_start(const char* p) {
@@ -280,7 +288,7 @@ inline Time date_start(const char* p) {
     const auto byte = [&](size_t i) { return static_cast<unsigned char>(p[i]); };
     DateCacheEntry& entry = cache[(byte(8) * 10 + byte(9) +
         byte(6) * 31 + byte(5) * 77 + byte(3) * 13) & (cache.size() - 1)];
-    if (entry.prefix == prefix && entry.suffix == suffix) return entry.milliseconds;
+    if (entry.prefix == prefix && entry.suffix == suffix) return entry.seconds;
 
     const int year = fixed_digits(p, 4), month = fixed_digits(p + 5, 2);
     const int day = fixed_digits(p + 8, 2);
@@ -288,11 +296,13 @@ inline Time date_start(const char* p) {
     static constexpr int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     const bool leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     if (day > month_days[month - 1] + leap) return bad_time;
-    entry = {prefix, suffix, civil_days(year, month, day) * day_ms};
-    return entry.milliseconds;
+    entry = {prefix, suffix, civil_days(year, month, day) * (day_ms / 1000)};
+    return entry.seconds;
 }
 
+template<bool Seconds = false>
 inline Time timestamp(Text value, bool utc_only = false) {
+    if constexpr (Seconds) utc_only = true;
     const size_t size = value.size();
     const bool f1 = size == 20 && value[19] == 'Z';
     const bool f2 = !utc_only && size == 25 && (value[19] == '+' || value[19] == '-');
@@ -313,7 +323,9 @@ inline Time timestamp(Text value, bool utc_only = false) {
         if (p[22] != ':' || h < 0 || h > 23 || m < 0 || m > 59) return bad_time;
         offset = (h * 60 + m) * (p[19] == '-' ? -1 : 1);
     }
-    return start + ((hour * 60 + minute - offset) * 60 + second) * Time{1000};
+    const Time seconds = start + (hour * 60 + minute - offset) * 60 + second;
+    if constexpr (Seconds) return seconds;
+    return seconds * 1000;
 }
 
 inline int32_t epoch_day(Time time) {
