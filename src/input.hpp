@@ -58,6 +58,9 @@ using KeyMap = std::unordered_map<Key, Value, KeyHash>;
 
 class Keys {
     static constexpr Key wide = Key{1} << 63;
+    static constexpr Key raw_suffix = wide | (Key{1} << 55);
+    static constexpr Key user_prefix = Key{1} << 47;
+    static constexpr Key byte_highs = UINT64_C(0x8080808080808080);
     std::mutex mutex_;
     std::deque<std::string> strings_;
     std::unordered_map<Text, Key> indices_;
@@ -73,6 +76,14 @@ class Keys {
 
 public:
     Key encode(Text text) {
+        if (text.size() == 9 && (text.front() == 'e' || text.front() == 'u')) {
+            Key suffix;
+            std::memcpy(&suffix, text.data() + 1, 8);
+            if ((suffix & byte_highs) == 0) {
+                // ASCII leaves spare high bits in the eight bytes.
+                return suffix | raw_suffix | (text.front() == 'u' ? user_prefix : 0);
+            }
+        }
 #ifdef __BMI2__
         if (text.size() == 9) {
             uint64_t leading;
@@ -100,6 +111,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const auto prior = indices_.find(text);
         if (prior != indices_.end()) return prior->second;
+        if (strings_.size() >= (raw_suffix ^ wide)) throw std::runtime_error("too many wide IDs");
         const Key key = wide | strings_.size();
         strings_.emplace_back(text);
         indices_.emplace(Text(strings_.back()), key);
@@ -107,6 +119,12 @@ public:
     }
 
     Text text(Key key, char (&buffer)[9]) {
+        if ((key & raw_suffix) == raw_suffix) {
+            buffer[0] = (key & user_prefix) ? 'u' : 'e';
+            const Key suffix = key & ~(raw_suffix | user_prefix);
+            std::memcpy(buffer + 1, &suffix, 8);
+            return Text(buffer, 9);
+        }
         if ((key & wide) == 0) return decode(key, buffer);
         std::lock_guard<std::mutex> lock(mutex_);
         return strings_[key & ~wide];
