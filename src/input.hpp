@@ -362,7 +362,11 @@ struct DateCacheEntry {
     Time seconds = bad_time;
 };
 
-inline UtcDate utc_date(const char* p) {
+inline UtcDate utc_date_impl(const char* p
+#ifdef __AVX2__
+                            , __m128i input
+#endif
+) {
     static thread_local std::array<DateCacheEntry, 128> cache;
     // Adjacent months map to different halves. Each half has a slot for every day.
     const size_t slot = (static_cast<unsigned char>(p[9]) & 15)
@@ -372,8 +376,6 @@ inline UtcDate utc_date(const char* p) {
     uint64_t prefix;
     uint16_t suffix;
 #ifdef __AVX2__
-    // F1 and F2 both provide at least 20 bytes. Only the first ten form the date.
-    const auto input = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
     const auto cached = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&entry));
     const auto date_mask = _mm_set_epi64x(UINT64_C(0xffff), -1);
     const auto diff = _mm_xor_si128(input, cached);
@@ -396,6 +398,15 @@ inline UtcDate utc_date(const char* p) {
     const auto epoch = static_cast<int32_t>(civil_days(year, month, day));
     entry = {prefix, suffix, 0, epoch, epoch * (day_ms / 1000)};
     return {entry.seconds, entry.day};
+}
+
+inline UtcDate utc_date(const char* p) {
+#ifdef __AVX2__
+    // F1 and F2 both provide at least 20 bytes. Only the first ten form the date.
+    return utc_date_impl(p, _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+#else
+    return utc_date_impl(p);
+#endif
 }
 
 constexpr unsigned ingest_clock_bits = 24;
@@ -470,6 +481,59 @@ inline Time timestamp(Text value, bool utc_only = false) {
     const Time seconds = start + (hour * 60 + minute - offset) * 60 + second;
     if constexpr (Seconds) return seconds;
     return seconds * 1000;
+}
+
+struct EventTimes {
+    IngestClock ingest;
+    Time event;
+};
+
+#if defined(__AVX2__) && defined(__BMI2__)
+inline EventTimes same_date_times(Text event, Text ingest) {
+    if (event.size() != 20 || ingest.size() != 20 ||
+        event[10] != 'T' || ingest[10] != 'T' || event[19] != 'Z' || ingest[19] != 'Z') return {{}, bad_time};
+
+    const auto event_date = _mm_loadu_si128(reinterpret_cast<const __m128i*>(event.data()));
+    const auto ingest_date = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ingest.data()));
+    const auto date_mask = _mm_set_epi64x(UINT64_C(0xffff), -1);
+    if (!_mm_testz_si128(_mm_xor_si128(event_date, ingest_date), date_mask)) return {{}, bad_time};
+
+    uint64_t event_word, ingest_word;
+    std::memcpy(&event_word, event.data() + 11, 8);
+    std::memcpy(&ingest_word, ingest.data() + 11, 8);
+    const auto clocks = _mm_set_epi64x(ingest_word, event_word);
+    constexpr auto digit_mask = UINT64_C(0x0f0f000f0f000f0f);
+    const auto digit_lanes = _mm_set1_epi64x(digit_mask);
+    const auto required = _mm_set1_epi64x(UINT64_C(0x30303a30303a3030));
+    const auto syntax = _mm_xor_si128(_mm_andnot_si128(digit_lanes, clocks), required);
+    const auto digits = _mm_and_si128(clocks, digit_lanes);
+    const auto oversized = _mm_and_si128(_mm_add_epi8(digits, _mm_set1_epi8(6)), _mm_set1_epi8(16));
+    const auto failures = _mm_or_si128(syntax, oversized);
+    if (!_mm_testz_si128(failures, failures)) return {{}, bad_time};
+
+    const auto compact = _mm_shuffle_epi8(digits, _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1,
+                                                                 8, 9, 11, 12, 14, 15, -1, -1));
+    const auto pairs = _mm_maddubs_epi16(compact, _mm_set1_epi16(0x010a));
+    if (_mm_movemask_epi8(_mm_cmpgt_epi16(pairs, _mm_setr_epi16(23, 59, 59, 0, 23, 59, 59, 0)))) {
+        return {{}, bad_time};
+    }
+    const UtcDate date = utc_date_impl(event.data(), event_date);
+    if (date.seconds == bad_time) return {{}, bad_time};
+    const auto weighted = _mm_madd_epi16(pairs, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+    const int32_t seconds = _mm_cvtsi128_si32(weighted) + _mm_extract_epi32(weighted, 1);
+    const auto order = (static_cast<uint64_t>(date.day + ingest_day_bias) << ingest_clock_bits) |
+        _pext_u64(__builtin_bswap64(ingest_word), digit_mask);
+    return {{order, date.seconds * 1000}, (date.seconds + seconds) * 1000};
+}
+#endif
+
+inline EventTimes event_times(Text event, Text ingest) {
+#if defined(__AVX2__) && defined(__BMI2__)
+    const EventTimes pair = same_date_times(event, ingest);
+    if (pair.ingest.order) return pair;
+#endif
+    const IngestClock clock = ingest_clock(ingest);
+    return {clock, clock.order ? timestamp(event) : bad_time};
 }
 
 inline int32_t epoch_day(Time time) {

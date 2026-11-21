@@ -518,10 +518,9 @@ void event_chunk(Text bytes, Keys& keys, const Catalog& catalog,
         if (!fields(row, c) || c[0].empty()) return;
         // The mixer is a bijection, so its result remains an exact event key.
         const Key id = hash_key(keys.encode(c[0]));
-        const IngestClock ingest = ingest_clock(c[3]);
+        const auto [ingest, time] = event_times(c[2], c[3]);
         if (ingest.order == 0) throw std::runtime_error("invalid guaranteed ingest_ts");
         typename Layout::Event event{};
-        const Time time = timestamp(c[2]);
         const bool purchase = c[4] == "purchase";
         if (!c[1].empty() && !c[5].empty() && (purchase || c[4] == "view" || c[4] == "cart")
             && time >= start && time < end && ingest.timely(time)) {
