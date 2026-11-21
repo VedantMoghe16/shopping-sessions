@@ -1,0 +1,7 @@
+/dev/
+/out/
+/scratch/
+/dev-answer/
+*.zip
+*.pyc
+__pycache__/
