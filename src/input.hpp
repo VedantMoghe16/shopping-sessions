@@ -349,21 +349,33 @@ struct UtcDate {
 struct DateCacheEntry {
     uint64_t prefix = 0;
     uint16_t suffix = 0;
+    uint16_t reserved = 0;
     int32_t day = 0;
     Time seconds = bad_time;
 };
 
 inline UtcDate utc_date(const char* p) {
     static thread_local std::array<DateCacheEntry, 128> cache;
-    uint64_t prefix;
-    uint16_t suffix;
-    std::memcpy(&prefix, p, 8);
-    std::memcpy(&suffix, p + 8, 2);
     const auto byte = [&](size_t i) { return static_cast<unsigned char>(p[i]); };
     const size_t slot = (byte(8) * 10 + byte(9) +
         byte(6) * 31 + byte(5) * 77 + byte(3) * 13) & (cache.size() - 1);
     DateCacheEntry& entry = cache[slot];
+    uint64_t prefix;
+    uint16_t suffix;
+#ifdef __AVX2__
+    // F1 and F2 both provide at least 20 bytes. Only the first ten form the date.
+    const auto input = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    const auto cached = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&entry));
+    const auto date_mask = _mm_set_epi64x(UINT64_C(0xffff), -1);
+    const auto diff = _mm_xor_si128(input, cached);
+    if (_mm_testz_si128(diff, date_mask)) return {entry.seconds, entry.day};
+    prefix = static_cast<uint64_t>(_mm_cvtsi128_si64(input));
+    suffix = static_cast<uint16_t>(_mm_extract_epi16(input, 4));
+#else
+    std::memcpy(&prefix, p, 8);
+    std::memcpy(&suffix, p + 8, 2);
     if (entry.prefix == prefix && entry.suffix == suffix) return {entry.seconds, entry.day};
+#endif
     if (p[4] != '-' || p[7] != '-') return {};
 
     const int year = fixed_digits(p, 4), month = fixed_digits(p + 5, 2);
@@ -373,7 +385,7 @@ inline UtcDate utc_date(const char* p) {
     const bool leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     if (day > month_days[month - 1] + leap) return {};
     const auto epoch = static_cast<int32_t>(civil_days(year, month, day));
-    entry = {prefix, suffix, epoch, epoch * (day_ms / 1000)};
+    entry = {prefix, suffix, 0, epoch, epoch * (day_ms / 1000)};
     return {entry.seconds, entry.day};
 }
 
