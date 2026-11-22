@@ -20,7 +20,7 @@ extern "C" int __llvm_profile_write_file() noexcept __attribute__((weak));
 
 namespace shopping {
 constexpr size_t partitions = 256;
-constexpr size_t chunk_bytes = 4 * 1024 * 1024;
+constexpr size_t chunk_bytes = 2 * 1024 * 1024;
 constexpr Time session_gap = 1800000;
 #ifndef SHOPPING_BUCKET_THRESHOLD
 #define SHOPPING_BUCKET_THRESHOLD 16
@@ -469,7 +469,7 @@ struct OpaqueCandidate : Candidate {
 template<class Layout>
 struct WorkerInput {
     RecordArena candidate_storage, event_storage, identity_storage;
-    std::array<RecordBuffers<typename Layout::Candidate>, partitions> candidates;
+    std::array<RecordBuffers<typename Layout::Candidate, 1024>, partitions> candidates;
     std::array<RecordBuffers<OpaqueCandidate<typename Layout::Candidate>, 512>, partitions> opaque_candidates;
     std::vector<WideEvents::Candidate> extra;
     std::array<RecordBuffers<typename Layout::Event, 512>, partitions> events;
@@ -483,22 +483,35 @@ struct WorkerInput {
 };
 
 struct Chunk {
-    size_t offset, size;
+    Text file;
     const fs::path* path;
-    const char* mapped;
+    size_t offset, size;
     bool events;
 };
 
 void load_chunks(Inputs& inputs, const fs::path& path, bool events, std::vector<Chunk>& chunks) {
     inputs.folder(path, [&](Text bytes, const fs::path& source) {
-        size_t begin = next_line(bytes, 0);
-        while (begin < bytes.size()) {
-            size_t end = std::min(begin + chunk_bytes, bytes.size());
-            if (end != bytes.size() && bytes[end - 1] != '\n') end = next_line(bytes, end);
-            chunks.push_back({begin, end - begin, &source, bytes.data() + begin, events});
-            begin = end;
+        for (size_t begin = 0; begin < bytes.size();) {
+            const size_t count = std::min(chunk_bytes, bytes.size() - begin);
+            chunks.push_back({bytes, &source, begin, count, events});
+            begin += count;
         }
     });
+}
+
+Text rows_for_chunk(const Chunk& chunk) {
+    size_t begin = chunk.offset;
+    size_t end = begin + chunk.size;
+    const Text file = chunk.file;
+    if (begin == 0 || file[begin - 1] != '\n') {
+        // Skip the header or the partial row owned by the preceding chunk.
+        const size_t newline = file.substr(begin, chunk.size).find('\n');
+        if (newline == Text::npos) return {};
+        begin += newline + 1;
+    }
+    if (begin == end) return {};
+    if (end != file.size() && file[end - 1] != '\n') end = next_line(file, end);
+    return Text(file.data() + begin, end - begin);
 }
 
 class ChunkReader {
@@ -508,7 +521,7 @@ class ChunkReader {
 public:
     Text read(const Chunk& chunk) {
         // A single long row can extend a chunk past the usual buffer size.
-        if (chunk.size > 2 * chunk_bytes) return Text(chunk.mapped, chunk.size);
+        if (chunk.size > 2 * chunk_bytes) return chunk.file.substr(chunk.offset, chunk.size);
         if (capacity_ < chunk.size) {
             buffer_.reset(new char[chunk.size]);
             capacity_ = chunk.size;
@@ -862,7 +875,7 @@ public:
         }
     }
 
-    void flush(Key user, int32_t day) {
+    void flush(Key key, Text user, int32_t day) {
         Key best = 0;
         int64_t best_revenue = 0;
         for (uint32_t c : touched_) {
@@ -874,8 +887,8 @@ public:
             }
             categories_[c] = 0;
         }
-        char user_buffer[9], best_buffer[9];
-        writer_.add(keys_.text(user, user_buffer), keys_.text(best, best_buffer), best_revenue != 0,
+        char best_buffer[9];
+        writer_.add_user(key, user, keys_.text(best, best_buffer), best_revenue != 0,
                     day, {sessions_, events_, revenue_});
         touched_.clear();
         sessions_ = events_ = revenue_ = 0;
@@ -1025,14 +1038,15 @@ void summarize(PersonPartition& rows, Keys& keys, const Catalog& catalog,
     std::vector<size_t> occupied;
     std::vector<BucketPurchase> purchases;
     for (const PersonGroup& group : rows.groups) {
-        const Key user = unmix_key(group.person);
+        char user_buffer[9];
+        const Text user = keys.text(unmix_key(group.person), user_buffer);
         const size_t event_end = group.event_end + group.events;
         Time previous = 0;
         int32_t day = 0;
         const auto begin_segment = [&](Time first, Time last) {
             if (sessions.empty() || first - previous > session_gap) {
                 const int32_t next = epoch_day(first);
-                if (!sessions.empty() && next != day) days.flush(user, day);
+                if (!sessions.empty() && next != day) days.flush(group.person, user, day);
                 day = next;
                 days.start_session();
                 sessions.push_back({first});
@@ -1084,7 +1098,7 @@ void summarize(PersonPartition& rows, Keys& keys, const Catalog& catalog,
                 sessions.back().revenue += event.cents;
             }
         }
-        days.flush(user, day);
+        days.flush(group.person, user, day);
         const size_t click_end = group.click_end + group.clicks;
         if (group.clicks != 0 && sessions.size() <= Attribution::mask_capacity) {
             attribution.small(sessions, rows.clicks, group.click_end, click_end);
@@ -1147,12 +1161,15 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
             return;
         }
         const Chunk& chunk = chunks[task - 1];
-        const Text bytes = readers[worker].read(chunk);
+        const Text mapped = rows_for_chunk(chunk);
+        if (mapped.empty()) return;
+        const size_t offset = static_cast<size_t>(mapped.data() - chunk.file.data());
+        const Text bytes = readers[worker].read({chunk.file, chunk.path, offset, mapped.size(), chunk.events});
         if (chunk.events) {
-            event_chunk(bytes, chunk.mapped, keys, catalog, workers[worker], worker, start, end, layout);
+            event_chunk(bytes, mapped.data(), keys, catalog, workers[worker], worker, start, end, layout);
         } else {
             links_ready.get();
-            click_chunk(bytes, chunk.mapped, keys, catalog, links, workers[worker], start, end);
+            click_chunk(bytes, mapped.data(), keys, catalog, links, workers[worker], start, end);
         }
     });
     keys.freeze();

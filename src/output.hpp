@@ -3,6 +3,7 @@
 #include "input.hpp"
 
 #include <fstream>
+#include <memory>
 #include <utility>
 
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
@@ -11,12 +12,13 @@
 
 namespace shopping {
 namespace flat_parquet {
-// A flat, PLAIN DataPage V1 writer for the two output schemas.
+// A flat DataPage V1 writer for the two output schemas.
 enum class Wire : uint8_t { i32 = 5, i64 = 6, binary = 8, list = 9, structure = 12 };
 enum class Physical { int32 = 1, int64 = 2, bytes = 6 };
 enum class Logical { none = -1, string = 0, date = 6 };
 constexpr uint32_t plain = 0;
 constexpr uint32_t rle = 3;
+constexpr uint32_t rle_dictionary = 8;
 constexpr uint32_t codec = 0;
 
 struct Column {
@@ -90,14 +92,31 @@ inline void schema_leaf(std::string& footer, Column column) {
     node.end();
 }
 
-struct Strings {
-    std::string values;
+class Strings {
+    std::unique_ptr<char[]> bytes_;
+    size_t size_ = 0, capacity_ = 0;
+
+public:
     std::vector<uint8_t> valid;
+
+    Text values() const { return size_ ? Text(bytes_.get(), size_) : Text{}; }
 
     void append(Text value) {
         if (value.size() > INT32_MAX) throw std::runtime_error("Parquet string too long");
-        little_u32(values, static_cast<uint32_t>(value.size()));
-        values.append(value);
+        const auto length = static_cast<uint32_t>(value.size());
+        const size_t next = size_ + sizeof(length) + length;
+        if (next > INT32_MAX) throw std::runtime_error("Parquet string page too large");
+        if (next > capacity_) {
+            const size_t reserve = std::max(next, std::max(size_t{64}, capacity_ * 2));
+            std::unique_ptr<char[]> storage(new char[reserve]);
+            if (size_) std::memcpy(storage.get(), bytes_.get(), size_);
+            bytes_ = std::move(storage);
+            capacity_ = reserve;
+        }
+        char* destination = bytes_.get() + size_;
+        std::memcpy(destination, &length, sizeof(length));
+        if (length) std::memcpy(destination + sizeof(length), value.data(), length);
+        size_ = next;
     }
 
     void append_optional(Text value, bool present, size_t row) {
@@ -108,7 +127,7 @@ struct Strings {
     }
 
     void clear() {
-        values.clear();
+        size_ = 0;
         valid.clear();
     }
 };
@@ -143,6 +162,7 @@ class BatchWriter {
 
     struct Chunk {
         uint64_t offset, bytes;
+        uint64_t dictionary_offset = 0;
     };
     struct Group {
         std::array<Chunk, columns> chunks;
@@ -155,7 +175,9 @@ class BatchWriter {
     flat_parquet::Strings first_, second_;
     std::vector<int32_t> days_;
     std::array<std::vector<int64_t>, Count> numbers_;
-    std::string header_, nullable_;
+    std::string header_, nullable_, user_runs_;
+    Key last_user_ = 0;
+    uint32_t user_count_ = 0, user_run_ = 0;
 
     void write(Text bytes) {
         if (!bytes.empty()) file_.write(bytes.data(), bytes.size());
@@ -167,7 +189,7 @@ class BatchWriter {
         return Text(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(Integer));
     }
 
-    Chunk page(Text payload) {
+    Chunk page(Text payload, uint32_t encoding = flat_parquet::plain) {
         if (payload.size() > INT32_MAX)
             throw std::runtime_error("Parquet page too large");
         header_.clear();
@@ -178,7 +200,7 @@ class BatchWriter {
         header.structure(5);
         Compact data_page(header_);
         data_page.number(1, Wire::i32, days_.size());
-        data_page.number(2, Wire::i32, flat_parquet::plain);
+        data_page.number(2, Wire::i32, encoding);
         data_page.number(3, Wire::i32, flat_parquet::rle);
         data_page.number(4, Wire::i32, flat_parquet::rle);
         data_page.end();
@@ -189,6 +211,45 @@ class BatchWriter {
         return chunk;
     }
 
+    void end_user_run() {
+        if (user_run_ == 0) return;
+        flat_parquet::varint(user_runs_, static_cast<uint64_t>(user_run_) << 1);
+        const auto index = static_cast<uint16_t>(user_count_ - 1);
+        user_runs_.append(reinterpret_cast<const char*>(&index), sizeof(index));
+        user_run_ = 0;
+    }
+
+    Chunk user_dictionary() {
+        const Text dictionary = first_.values();
+        if (user_count_ == days_.size()) {
+            user_count_ = user_run_ = 0;
+            user_runs_.clear();
+            return page(dictionary);
+        }
+        end_user_run();
+        const uint64_t dictionary_offset = offset_;
+        header_.clear();
+        Compact header(header_);
+        header.number(1, Wire::i32, 2);  // DICTIONARY_PAGE
+        header.number(2, Wire::i32, dictionary.size());
+        header.number(3, Wire::i32, dictionary.size());
+        header.structure(7);
+        Compact items(header_);
+        items.number(1, Wire::i32, user_count_);
+        items.number(2, Wire::i32, flat_parquet::plain);
+        items.end();
+        header.end();
+        write(header_);
+        write(dictionary);
+
+        Chunk chunk = page(user_runs_, flat_parquet::rle_dictionary);
+        chunk.bytes += chunk.offset - dictionary_offset;
+        chunk.dictionary_offset = dictionary_offset;
+        user_runs_.clear();
+        user_count_ = 0;
+        return chunk;
+    }
+
     Text optional_strings() {
         // One hybrid bit-packed run of 1-bit definitions, padded to a whole byte.
         nullable_.clear();
@@ -196,7 +257,7 @@ class BatchWriter {
         const uint32_t levels_size = nullable_.size() + second_.valid.size();
         nullable_.insert(0, reinterpret_cast<const char*>(&levels_size), sizeof(levels_size));
         nullable_.append(reinterpret_cast<const char*>(second_.valid.data()), second_.valid.size());
-        nullable_.append(second_.values);
+        nullable_.append(second_.values());
         return nullable_;
     }
 
@@ -225,9 +286,11 @@ class BatchWriter {
                 column_chunk.structure(3);
                 Compact column_metadata(bytes);
                 column_metadata.number(1, Wire::i32, static_cast<int>(column.type));
-                column_metadata.list(2, Wire::i32, column.nullable ? 2 : 1);
+                const bool dictionary = chunk.dictionary_offset != 0;
+                column_metadata.list(2, Wire::i32, column.nullable || dictionary ? 2 : 1);
                 flat_parquet::varint(bytes, flat_parquet::plain << 1);
                 if (column.nullable) flat_parquet::varint(bytes, flat_parquet::rle << 1);
+                if (dictionary) flat_parquet::varint(bytes, flat_parquet::rle_dictionary << 1);
                 column_metadata.list(3, Wire::binary, 1);
                 Compact::binary_value(bytes, column.name);
                 column_metadata.number(4, Wire::i32, flat_parquet::codec);
@@ -235,6 +298,7 @@ class BatchWriter {
                 column_metadata.number(6, Wire::i64, chunk.bytes);
                 column_metadata.number(7, Wire::i64, chunk.bytes);
                 column_metadata.number(9, Wire::i64, chunk.offset);
+                if (dictionary) column_metadata.number(11, Wire::i64, chunk.dictionary_offset);
                 column_metadata.end();
                 column_chunk.end();
                 group_bytes += chunk.bytes;
@@ -263,6 +327,27 @@ public:
     void add(Text first, Text second, bool second_present, int32_t day,
              const std::array<int64_t, Count>& numbers) {
         first_.append(first);
+        add_row(second, second_present, day, numbers);
+    }
+
+    void add_user(Key user, Text name, Text category, bool category_present, int32_t day,
+                  const std::array<int64_t, Count>& numbers) {
+        static_assert(Count == 3);
+        // Each shopper's rows are contiguous. Reset the dictionary on every row-group boundary.
+        if (user_count_ == 0) user_runs_.push_back(16);
+        if (user_count_ == 0 || user != last_user_) {
+            end_user_run();
+            first_.append(name);
+            last_user_ = user;
+            ++user_count_;
+        }
+        ++user_run_;
+        add_row(category, category_present, day, numbers);
+    }
+
+private:
+    void add_row(Text second, bool second_present, int32_t day,
+                 const std::array<int64_t, Count>& numbers) {
         if constexpr (Count == 3) second_.append_optional(second, second_present, days_.size());
         else second_.append(second);
         days_.push_back(day);
@@ -274,8 +359,9 @@ public:
         if (days_.empty()) return;
         Group group{{}, days_.size()};
         size_t col = 0;
-        group.chunks[col++] = page(first_.values);
-        if constexpr (Count == 4) group.chunks[col++] = page(second_.values);
+        if constexpr (Count == 3) group.chunks[col++] = user_dictionary();
+        else group.chunks[col++] = page(first_.values());
+        if constexpr (Count == 4) group.chunks[col++] = page(second_.values());
         group.chunks[col++] = page(integer_bytes(days_));
         for (auto& values : numbers_) {
             group.chunks[col++] = page(integer_bytes(values));
@@ -289,6 +375,7 @@ public:
         rows_ += group.rows;
     }
 
+public:
     void close() {
         flush();
         footer();

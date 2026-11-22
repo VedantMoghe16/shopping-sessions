@@ -11,6 +11,7 @@ for name in ("events", "clicks", "links"):
     (root / name).mkdir(parents=True, exist_ok=True)
 
 randomizer = random.Random(321)
+dialect = random.Random(937)
 start = datetime(2025, 1, 6, tzinfo=timezone.utc)
 end = start + timedelta(days=14)
 alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -30,6 +31,10 @@ def timestamp(value, choice):
 
 
 def key(prefix, number):
+    if number % 64 == 11:
+        return f"{prefix}-opaque-ñ-{number:x}"
+    if number % 8 == 3:
+        return f"{prefix}{number:032x}"
     chars = []
     while number:
         number, digit = divmod(number, len(alphabet))
@@ -42,6 +47,11 @@ def writer(name, header):
     rows = csv.writer(handle, lineterminator="\n")
     rows.writerow(header)
     return handle, rows
+
+
+def quoted_row(handle, values):
+    fields = [f'"{value}"' if dialect.randrange(5) == 0 else value for value in values]
+    handle.write(",".join(fields) + "\n")
 
 
 def sampled_time(begin, seconds):
@@ -82,18 +92,16 @@ with handle:
         event_id = key("e", (i * 1315423911 + 17) % 36**8)
         event = [event_id, user, stamp, f1(time + timedelta(seconds=lag)), event_type,
                  f"p{i % 4000}", str(i % 50000 + 1) if event_type == "purchase" else ""]
-        if i % 9 == 0:
-            handle.write(",".join(f'"{value}"' for value in event) + "\n")
-        else:
-            rows.writerow(event)
+        quoted_row(handle, event)
         if i % 27 == 0:
             event[3] = f1(time + timedelta(seconds=lag + 1))
-            rows.writerow(event)
+            quoted_row(handle, event)
+
 
 handle, rows = writer("clicks/part.csv", ["click_id", "user_id", "campaign_id", "ts"])
 with handle:
     for i in range(75000):
         time = sampled_time(start - timedelta(days=7), 21 * 86400)
         user = people[i % 12] if i % 12 == 0 else randomizer.choice(people)
-        rows.writerow([key("k", (i * 2654435761 + 97) % 36**8), user,
+        quoted_row(handle, [key("k", (i * 2654435761 + 97) % 36**8), user,
                        f"c_{i % 2000}", timestamp(time, i % 7)])
