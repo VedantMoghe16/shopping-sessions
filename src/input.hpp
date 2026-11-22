@@ -381,15 +381,25 @@ bool fields_simd(Text row, std::array<Text, N>& output) {
     const auto comma_bytes = _mm256_set1_epi8(',');
     const auto quote_bytes = _mm256_set1_epi8('"');
     DelimiterMask commas = 0, quotes = 0;
-    size_t position = 0;
-    for (; position < row.size(); position += 32) {
-        const size_t load_at = std::min(position, row.size() - 32);
-        const unsigned skip = position - load_at;
+    const auto add = [&](size_t position, size_t load_at, unsigned skip) {
         const auto block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row.data() + load_at));
         const uint32_t comma_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, comma_bytes));
         const uint32_t quote_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, quote_bytes));
         commas |= DelimiterMask(comma_mask >> skip) << position;
         quotes |= DelimiterMask(quote_mask >> skip) << position;
+    };
+    const size_t length = row.size();
+    add(0, 0, 0);
+    if (length > 32 && length < 64) {
+        add(32, length - 32, 64 - length);
+    } else if (length >= 64) {
+        add(32, 32, 0);
+        if (length > 64 && length < 96) {
+            add(64, length - 32, 96 - length);
+        } else if (length >= 96) {
+            add(64, 64, 0);
+            if (length > 96) add(96, length - 32, 128 - length);
+        }
     }
     const auto low = static_cast<uint64_t>(commas);
     const auto high = static_cast<uint64_t>(commas >> 64);
