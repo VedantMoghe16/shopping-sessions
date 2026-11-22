@@ -34,20 +34,18 @@ constexpr Time day_ms = 86400000;
 constexpr Time week_ms = 7 * day_ms;
 constexpr Time bad_time = std::numeric_limits<Time>::min();
 
+constexpr uint64_t key_multiplier = UINT64_C(0xd6e8feb86659fd93);
+constexpr uint64_t key_inverse_multiplier = UINT64_C(0xcfee444d8b59a89b);
+static_assert(key_multiplier * key_inverse_multiplier == 1);
+
 inline uint64_t hash_key(uint64_t key) {
-    key ^= key >> 30;
-    key *= UINT64_C(0xbf58476d1ce4e5b9);
-    key ^= key >> 27;
-    key *= UINT64_C(0x94d049bb133111eb);
-    return key ^ (key >> 31);
+    key = (key ^ (key >> 32)) * key_multiplier;
+    return key ^ (key >> 32);
 }
 
 inline Key unmix_key(uint64_t key) {
-    key ^= (key >> 31) ^ (key >> 62);
-    key *= UINT64_C(0x319642b2d24d8ec3);
-    key ^= (key >> 27) ^ (key >> 54);
-    key *= UINT64_C(0x96de1b173f119089);
-    return key ^ (key >> 30) ^ (key >> 60);
+    key = (key ^ (key >> 32)) * key_inverse_multiplier;
+    return key ^ (key >> 32);
 }
 
 struct KeyHash {
