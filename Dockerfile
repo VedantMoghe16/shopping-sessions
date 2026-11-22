@@ -15,14 +15,14 @@ RUN set -eu; \
     esac; \
     if [ ! -x /tmp/isa-check ] || /tmp/isa-check; then \
         python3 train.py /tmp/training; \
-        clang++-14 "$@" -std=c++17 -fno-plt -O3 -flto=thin -fuse-ld=/usr/bin/ld.lld-14 -DNDEBUG -pthread \
+        clang++-14 "$@" -std=c++17 -O3 -flto=thin -fuse-ld=/usr/bin/ld.lld-14 -DNDEBUG -pthread \
             -fprofile-generate -fprofile-update=atomic -Wl,-u,__llvm_profile_write_file \
             main.cpp -o /tmp/shopping-native; \
         LLVM_PROFILE_FILE=/tmp/cpu.profraw NCPU=4 /tmp/shopping-native /tmp/training /tmp/training-output; \
         llvm-profdata-14 merge /tmp/cpu.profraw -o /tmp/cpu.profdata; \
         set -- "$@" -fprofile-use=/tmp/cpu.profdata; \
     fi; \
-    clang++-14 "$@" -std=c++17 -fno-plt -O3 -flto=thin -fuse-ld=/usr/bin/ld.lld-14 -DNDEBUG -pthread main.cpp -o /tmp/shopping-native; \
+    clang++-14 "$@" -std=c++17 -O3 -flto=thin -fuse-ld=/usr/bin/ld.lld-14 -DNDEBUG -pthread main.cpp -o /tmp/shopping-native; \
     mkdir -p /app/licenses; \
     mv /tmp/shopping-native /app/; \
     cp /usr/share/doc/nlohmann-json3-dev/copyright /app/licenses/nlohmann-json.txt
@@ -30,8 +30,9 @@ RUN set -eu; \
 FROM debian:bookworm-slim
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libstdc++6 \
+    && apt-get install -y --no-install-recommends libstdc++6 libjemalloc2 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/ ./
 USER 1000:1000
+ENV LD_PRELOAD=libjemalloc.so.2
 ENTRYPOINT ["/app/shopping-native"]

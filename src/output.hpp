@@ -144,25 +144,19 @@ class BatchWriter {
     static constexpr size_t columns = Count + 3;
     static_assert(Count == 3 || Count == 4, "unsupported output schema");
 
-    static constexpr bool count_column(size_t index) {
-        // Revenue is the third numeric column in either table.
-        return index != 2;
-    }
-
-    std::array<Column, columns> schema() const {
-        const auto count = narrow_counts_ ? Physical::int32 : Physical::int64;
+    static constexpr std::array<Column, columns> schema() {
         if constexpr (Count == 3) {
             return {{{"user_id", Physical::bytes, Logical::string},
                      {"day", Physical::int32, Logical::date},
-                     {"sessions", count}, {"events", count},
+                     {"sessions", Physical::int64}, {"events", Physical::int64},
                      {"revenue_cents", Physical::int64},
                      {"top_category", Physical::bytes, Logical::string, true}}};
         } else {
             return {{{"campaign_id", Physical::bytes, Logical::string},
                      {"channel", Physical::bytes, Logical::string},
-                     {"day", Physical::int32, Logical::date}, {"sessions", count},
-                     {"purchasing_sessions", count}, {"revenue_cents", Physical::int64},
-                     {"assisted_sessions", count}}};
+                     {"day", Physical::int32, Logical::date}, {"sessions", Physical::int64},
+                     {"purchasing_sessions", Physical::int64}, {"revenue_cents", Physical::int64},
+                     {"assisted_sessions", Physical::int64}}};
         }
     }
 
@@ -175,14 +169,12 @@ class BatchWriter {
         size_t rows;
     };
 
-    const bool narrow_counts_;
     std::ofstream file_;
     uint64_t offset_ = 0, rows_ = 0;
     std::vector<Group> groups_;
     flat_parquet::Strings first_, second_;
     std::vector<int32_t> days_;
     std::array<std::vector<int64_t>, Count> numbers_;
-    std::array<std::vector<int32_t>, Count> small_numbers_;
     std::string header_, nullable_, user_runs_;
     Key last_user_ = 0;
     uint32_t user_count_ = 0, user_run_ = 0;
@@ -271,7 +263,7 @@ class BatchWriter {
 
     void footer() {
         std::string bytes;
-        const auto fields = schema();
+        constexpr auto fields = schema();
         Compact metadata(bytes);
         metadata.number(1, Wire::i32, 1);
         metadata.list(2, Wire::structure, columns + 1);
@@ -326,7 +318,7 @@ class BatchWriter {
     }
 
 public:
-    explicit BatchWriter(const fs::path& path, bool narrow_counts) : narrow_counts_(narrow_counts) {
+    explicit BatchWriter(const fs::path& path) {
         file_.exceptions(std::ios::badbit | std::ios::failbit);
         file_.open(path, std::ios::binary);
         write("PAR1");
@@ -359,14 +351,7 @@ private:
         if constexpr (Count == 3) second_.append_optional(second, second_present, days_.size());
         else second_.append(second);
         days_.push_back(day);
-        if (narrow_counts_) {
-            for (size_t i = 0; i < Count; ++i) {
-                if (count_column(i)) small_numbers_[i].push_back(static_cast<int32_t>(numbers[i]));
-                else numbers_[i].push_back(numbers[i]);
-            }
-        } else {
-            for (size_t i = 0; i < Count; ++i) numbers_[i].push_back(numbers[i]);
-        }
+        for (size_t i = 0; i < Count; ++i) numbers_[i].push_back(numbers[i]);
         if (days_.size() >= batch_size) flush();
     }
 
@@ -378,14 +363,9 @@ private:
         else group.chunks[col++] = page(first_.values());
         if constexpr (Count == 4) group.chunks[col++] = page(second_.values());
         group.chunks[col++] = page(integer_bytes(days_));
-        for (size_t i = 0; i < Count; ++i) {
-            if (narrow_counts_ && count_column(i)) {
-                group.chunks[col++] = page(integer_bytes(small_numbers_[i]));
-                small_numbers_[i].clear();
-            } else {
-                group.chunks[col++] = page(integer_bytes(numbers_[i]));
-                numbers_[i].clear();
-            }
+        for (auto& values : numbers_) {
+            group.chunks[col++] = page(integer_bytes(values));
+            values.clear();
         }
         if constexpr (Count == 3) group.chunks[col++] = page(optional_strings());
         first_.clear();

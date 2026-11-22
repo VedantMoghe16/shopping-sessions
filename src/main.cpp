@@ -270,8 +270,6 @@ struct TimedEvent {
 };
 
 struct WideEvents {
-    using Body = TimedEvent;
-
     struct Event {
         Key person;
         TimedEvent data;
@@ -281,9 +279,7 @@ struct WideEvents {
         return {person, {time, cents, category}};
     }
 
-    static Body body(const Event& event) { return event.data; }
-    static TimedEvent decode(const Body& event) { return event; }
-    static Time order(const Body& event) { return event.time; }
+    TimedEvent decode(const Event& event) const { return event.data; }
 
     struct Candidate {
         Key id;
@@ -306,10 +302,6 @@ struct CompactEvents {
     static constexpr uint32_t price_bits = 24;
     static constexpr uint32_t price_mask = (uint32_t{1} << price_bits) - 1;
 
-    struct Body {
-        uint32_t offset, purchase;
-    };
-
     struct Event {
         Key person;
         uint32_t offset, purchase;
@@ -322,10 +314,7 @@ struct CompactEvents {
         return {person, static_cast<uint32_t>(time - start), (category << price_bits) | cents};
     }
 
-    static Body body(const Event& event) { return {event.offset, event.purchase}; }
-    static uint32_t order(const Body& event) { return event.offset; }
-
-    TimedEvent decode(const Body& event) const {
+    TimedEvent decode(const Event& event) const {
         return {start + event.offset, event.purchase & price_mask, event.purchase >> price_bits};
     }
 
@@ -346,7 +335,7 @@ struct CompactEvents {
         }
         if (extra.size() > extra_index_mask) throw std::runtime_error("too many indirect events");
         const uint64_t pointer = indirect | (static_cast<uint64_t>(worker) << 48) | extra.size();
-        extra.push_back({id, ingest, {event.person, decode(body(event))}});
+        extra.push_back({id, ingest, {event.person, decode(event)}});
         return {id, event.person, pointer};
     }
 
@@ -663,24 +652,22 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
     size_t buckets = 64;
     while (buckets < 16 * count) buckets *= 2;
     std::vector<uint64_t> seen(buckets / 64), collided(buckets / 64);
+    size_t repeats = 0;
     for (auto& worker : workers) {
         buffers(worker).each([&](const Record& row) {
             const size_t bucket = (row.id >> partition_bits) & (buckets - 1);
             const uint64_t bit = uint64_t{1} << (bucket & 63);
             const size_t word = bucket >> 6;
-            const uint64_t prior = seen[word];
-            collided[word] |= prior & bit;
-            seen[word] = prior | bit;
+            const uint64_t hit = seen[word] & bit;
+            repeats += hit != 0;
+            collided[word] |= hit;
+            seen[word] |= bit;
         });
     }
-    size_t repeats = count;
-    for (uint64_t word : seen) repeats -= __builtin_popcountll(word);
     size_t slots = 1;
     // Every collided bucket contains at most twice its number of repeat visits.
     while (slots < repeats * 3 + 1) slots *= 2;
     std::vector<const Record*> winners(slots, nullptr);
-    // Keep exact winner probing independent of the collision bitmap's low bits.
-    const unsigned winner_shift = __builtin_ctzll(buckets);
     std::array<Event, 32> pending;
     size_t pending_count = 0;
     auto flush = [&] {
@@ -703,7 +690,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
             if ((collided[bucket >> 6] & (uint64_t{1} << (bucket & 63))) == 0) {
                 emit(layout.event(row, workers));
             } else {
-                size_t i = (hash >> winner_shift) & (slots - 1);
+                size_t i = hash & (slots - 1);
                 while (const Record* winner = winners[i]) {
                     if (winner->id == row.id) {
                         if constexpr (Type == CandidateType::short_text) break;
@@ -779,16 +766,15 @@ bool click_id_less(const TimedClick& a, const TimedClick& b, Keys& keys) {
     return text(a, a_buffer).compare(text(b, b_buffer)) < 0;
 }
 
-template<class Body>
 struct PersonPartition {
-    std::vector<Body> events;
+    std::vector<TimedEvent> events;
     std::vector<TimedClick> clicks;
     std::vector<PersonGroup> groups;
 };
 
 template<class Layout>
-PersonPartition<typename Layout::Body> group_by_person(std::vector<WorkerInput<Layout>>& workers, size_t part,
-                                size_t bucket_count) {
+PersonPartition group_by_person(std::vector<WorkerInput<Layout>>& workers, size_t part,
+                                size_t bucket_count, const Layout& layout) {
     using Event = typename Layout::Event;
     PersonGroups index;
     size_t event_count = 0, click_count = 0;
@@ -813,13 +799,13 @@ PersonPartition<typename Layout::Body> group_by_person(std::vector<WorkerInput<L
         group.event_end = event_offset += group.events;
         group.click_end = click_offset += group.clicks;
     }
-    PersonPartition<typename Layout::Body> result;
+    PersonPartition result;
     result.events.resize(event_count);
     result.clicks.resize(click_count);
     for (auto& worker : workers) {
         worker.events[part].each([&](const Event& event) {
             PersonGroup& group = index.groups[event.person];
-            result.events[--group.event_end] = Layout::body(event);
+            result.events[--group.event_end] = layout.decode(event);
         });
         worker.events[part].clear();
         for (const Click& click : worker.clicks[part]) {
@@ -830,7 +816,7 @@ PersonPartition<typename Layout::Body> group_by_person(std::vector<WorkerInput<L
         }
         std::vector<Click>().swap(worker.clicks[part]);
     }
-    const auto earlier = [](const auto& a, const auto& b) { return Layout::order(a) < Layout::order(b); };
+    const auto earlier = [](const auto& a, const auto& b) { return a.time < b.time; };
     for (const PersonGroup& group : index.groups) {
         if (group.events > 1 && (!bucket_count || group.events < bucket_threshold)) {
             auto begin = result.events.begin() + group.event_end;
@@ -1069,9 +1055,8 @@ struct BucketPurchase {
     uint32_t cents, category;
 };
 
-template<class Layout>
-void summarize(PersonPartition<typename Layout::Body>& rows, Keys& keys, const Catalog& catalog,
-               BatchWriter<3>& writer, CampaignDays& totals, Time start, size_t bucket_count, const Layout& layout) {
+void summarize(PersonPartition& rows, Keys& keys, const Catalog& catalog,
+               BatchWriter<3>& writer, CampaignDays& totals, Time start, size_t bucket_count) {
     PersonDays days(keys, catalog, writer);
     Attribution attribution(totals, keys, catalog.names.size());
     std::vector<Session> sessions;
@@ -1097,7 +1082,7 @@ void summarize(PersonPartition<typename Layout::Body>& rows, Keys& keys, const C
         if (bucket_count && group.events >= bucket_threshold) {
             if (buckets.empty()) buckets.resize(bucket_count);
             for (size_t i = group.event_end; i < event_end; ++i) {
-                const TimedEvent event = layout.decode(rows.events[i]);
+                const TimedEvent& event = rows.events[i];
                 const size_t index = (event.time - start) / session_gap;
                 TimeBucket& bucket = buckets[index];
                 if (bucket.events == 0) {
@@ -1133,7 +1118,7 @@ void summarize(PersonPartition<typename Layout::Body>& rows, Keys& keys, const C
             purchases.clear();
         } else {
             for (size_t i = group.event_end; i < event_end; ++i) {
-                const TimedEvent event = layout.decode(rows.events[i]);
+                const TimedEvent& event = rows.events[i];
                 begin_segment(event.time, event.time);
                 days.event(event);
                 sessions.back().revenue += event.cents;
@@ -1173,18 +1158,6 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
 
     std::vector<Chunk> chunks;
     load_chunks(inputs, data / "events", true, chunks);
-    // Each candidate uses at least 27 source bytes (six separators, a valid
-    // 20-byte ingest stamp and a nonempty ID). Every output count is bounded
-    // by the number of event candidates, even for campaign assists.
-    uint64_t count_budget = uint64_t{INT32_MAX} * 27;
-    bool narrow_counts = true;
-    for (const Chunk& chunk : chunks) {
-        if (chunk.size > count_budget) {
-            narrow_counts = false;
-            break;
-        }
-        count_budget -= chunk.size;
-    }
     load_chunks(inputs, data / "clicks", false, chunks);
     std::sort(chunks.begin(), chunks.end(), [](const Chunk& a, const Chunk& b) {
         if (a.events != b.events) return a.events;
@@ -1262,15 +1235,15 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     fs::create_directories(user_output);
     fs::create_directories(campaign_output);
     for (size_t worker = 0; worker < ncpu; ++worker) {
-        writers.push_back(std::make_unique<BatchWriter<3>>(user_output / ("part-" + std::to_string(worker) + ".parquet"), narrow_counts));
+        writers.push_back(std::make_unique<BatchWriter<3>>(user_output / ("part-" + std::to_string(worker) + ".parquet")));
         counts.emplace_back(start, end, catalog.names.size());
     }
     const size_t time_buckets = (end - start + session_gap - 1) / session_gap;
     const size_t bucket_count = time_buckets <= 10000 ? time_buckets : 0;
     parallel(ncpu, person_partitions, [&](size_t worker, size_t task) {
         const size_t part = order[task];
-        auto rows = group_by_person(workers, part, bucket_count);
-        summarize(rows, keys, catalog, *writers[worker], counts[worker], start, bucket_count, layout);
+        auto rows = group_by_person(workers, part, bucket_count, layout);
+        summarize(rows, keys, catalog, *writers[worker], counts[worker], start, bucket_count);
     });
     parallel(ncpu, writers.size(), [&](size_t, size_t i) { writers[i]->close(); });
 
@@ -1280,7 +1253,7 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
             total.get(campaign, day).add(value);
         });
     }
-    BatchWriter<4> campaigns(campaign_output / "part-0.parquet", narrow_counts);
+    BatchWriter<4> campaigns(campaign_output / "part-0.parquet");
     total.each([&](uint32_t campaign, int32_t day, const Totals& value) {
         const auto& names = catalog.names[campaign];
         char id_buffer[9], channel_buffer[9];
