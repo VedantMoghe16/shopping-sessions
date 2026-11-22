@@ -57,6 +57,37 @@ struct KeyHash {
 template<class Value>
 using KeyMap = std::unordered_map<Key, Value, KeyHash>;
 
+struct HexWords {
+    uint64_t low;
+    uint64_t high;
+};
+
+template<char Prefix>
+inline bool lower_hex_words(Text value, HexWords& words) {
+#ifdef __AVX2__
+    if (value.size() != 33 || value[0] != Prefix) return false;
+    const auto raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(value.data() + 1));
+    const auto digits = _mm256_sub_epi8(raw, _mm256_set1_epi8('0'));
+    const auto letters = _mm256_sub_epi8(raw, _mm256_set1_epi8('a'));
+    const auto numeric = _mm256_cmpeq_epi8(digits, _mm256_min_epu8(digits, _mm256_set1_epi8(9)));
+    const auto lower = _mm256_cmpeq_epi8(letters, _mm256_min_epu8(letters, _mm256_set1_epi8(5)));
+    if (_mm256_movemask_epi8(_mm256_or_si256(numeric, lower)) != -1) return false;
+    const auto nibble = _mm256_add_epi8(_mm256_and_si256(raw, _mm256_set1_epi8(15)),
+        _mm256_andnot_si256(numeric, _mm256_set1_epi8(9)));
+    const auto pairs = _mm256_maddubs_epi16(nibble, _mm256_set1_epi16(0x0110));
+    const auto packed = _mm_packus_epi16(_mm256_castsi256_si128(pairs), _mm256_extracti128_si256(pairs, 1));
+    words.low = static_cast<uint64_t>(_mm_cvtsi128_si64(packed));
+    words.high = static_cast<uint64_t>(_mm_extract_epi64(packed, 1));
+    return true;
+#else
+    return false;
+#endif
+}
+
+inline uint64_t hex_identity(const HexWords& words) {
+    return hash_key(words.low ^ ((words.high << 19) | (words.high >> 45)));
+}
+
 class Keys {
     static constexpr Key wide = Key{1} << 63;
     static constexpr Key raw_suffix = wide | (Key{1} << 55);

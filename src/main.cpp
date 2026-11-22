@@ -19,15 +19,18 @@
 extern "C" int __llvm_profile_write_file() noexcept __attribute__((weak));
 
 namespace shopping {
-constexpr size_t partitions = 256;
+constexpr unsigned event_partition_bits = 9;
+constexpr unsigned opaque_partition_bits = 7;
+constexpr unsigned person_partition_bits = 9;
+constexpr size_t event_partitions = size_t{1} << event_partition_bits;
+constexpr size_t opaque_partitions = size_t{1} << opaque_partition_bits;
+constexpr size_t person_partitions = size_t{1} << person_partition_bits;
 constexpr size_t chunk_bytes = 2 * 1024 * 1024;
 constexpr Time session_gap = 1800000;
 #ifndef SHOPPING_BUCKET_THRESHOLD
 #define SHOPPING_BUCKET_THRESHOLD 16
 #endif
 constexpr size_t bucket_threshold = SHOPPING_BUCKET_THRESHOLD;
-
-size_t partition(Key key) { return hash_key(key) & (partitions - 1); }
 
 template<class Work>
 void parallel(size_t workers, size_t tasks, Work work) {
@@ -466,18 +469,29 @@ struct OpaqueCandidate : Candidate {
     }
 };
 
+template<class Candidate>
+struct HexCandidate : Candidate {
+    uint64_t high;
+
+    bool same_identity(const HexCandidate& other) const { return high == other.high; }
+};
+
+enum class CandidateType { short_text, opaque_text, lower_hex };
+
 template<class Layout>
 struct WorkerInput {
     RecordArena candidate_storage, event_storage, identity_storage;
-    std::array<RecordBuffers<typename Layout::Candidate, 1024>, partitions> candidates;
-    std::array<RecordBuffers<OpaqueCandidate<typename Layout::Candidate>, 512>, partitions> opaque_candidates;
+    std::array<RecordBuffers<typename Layout::Candidate, 1024>, event_partitions> candidates;
+    std::array<RecordBuffers<OpaqueCandidate<typename Layout::Candidate>, 512>, opaque_partitions> opaque_candidates;
+    std::array<RecordBuffers<HexCandidate<typename Layout::Candidate>, 512>, opaque_partitions> hex_candidates;
     std::vector<WideEvents::Candidate> extra;
-    std::array<RecordBuffers<typename Layout::Event, 512>, partitions> events;
-    std::array<std::vector<Click>, partitions> clicks;
+    std::array<RecordBuffers<typename Layout::Event, 512>, person_partitions> events;
+    std::array<std::vector<Click>, person_partitions> clicks;
 
     WorkerInput() {
         for (auto& buffer : candidates) buffer.set_arena(candidate_storage);
         for (auto& buffer : opaque_candidates) buffer.set_arena(candidate_storage);
+        for (auto& buffer : hex_candidates) buffer.set_arena(candidate_storage);
         for (auto& buffer : events) buffer.set_arena(event_storage);
     }
 };
@@ -568,9 +582,17 @@ void event_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& cata
         }
         if (c[0].size() <= 9) {
             const Key id = hash_key(keys.encode(c[0]));
-            worker.candidates[id & (partitions - 1)].push_back(
+            worker.candidates[id & (event_partitions - 1)].push_back(
                 layout.candidate(id, ingest.order, event, worker.extra, worker_id));
         } else {
+            HexWords words;
+            if (lower_hex_words<'e'>(c[0], words)) {
+                // Given the second word, the first can be recovered from its mixed form.
+                const Key id = hex_identity(words);
+                worker.hex_candidates[id & (opaque_partitions - 1)].push_back(
+                    {layout.candidate(id, ingest.order, event, worker.extra, worker_id), words.high});
+                return;
+            }
             constexpr Key hash_mask = (Key{1} << 56) - 1;
             const Key length = std::min(c[0].size(), static_cast<size_t>(UINT8_MAX));
             const Key fingerprint = (length << 56) | (std::hash<Text>{}(c[0]) & hash_mask);
@@ -582,7 +604,7 @@ void event_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& cata
                 std::memcpy(owned, c[0].data(), length);
                 identity = owned;
             }
-            worker.opaque_candidates[fingerprint & (partitions - 1)].push_back(
+            worker.opaque_candidates[fingerprint & (opaque_partitions - 1)].push_back(
                 {layout.candidate(fingerprint, ingest.order, event, worker.extra, worker_id), identity});
         }
     });
@@ -602,24 +624,28 @@ void click_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& cata
         const auto size = c[0].size();
         if (size > 9 && size <= UINT32_MAX) {
             const auto* address = mapped + (c[0].data() - bytes.data());
-            worker.clicks[person & (partitions - 1)].push_back(
+            worker.clicks[person & (person_partitions - 1)].push_back(
                 {person, time, reinterpret_cast<uintptr_t>(address), campaign, static_cast<uint32_t>(size)});
         } else {
-            worker.clicks[person & (partitions - 1)].push_back({person, time, keys.encode(c[0]), campaign, 0});
+            worker.clicks[person & (person_partitions - 1)].push_back({person, time, keys.encode(c[0]), campaign, 0});
         }
     });
 }
 
-template<bool Opaque, class Layout>
+template<CandidateType Type, class Layout>
 void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerInput<Layout>& writer,
                  const Links& links, const Layout& layout) {
+    constexpr unsigned partition_bits = Type == CandidateType::short_text
+        ? event_partition_bits : opaque_partition_bits;
     using Candidate = typename Layout::Candidate;
-    using Record = std::conditional_t<Opaque, OpaqueCandidate<Candidate>, Candidate>;
     using Event = typename Layout::Event;
     const auto buffers = [part](auto& worker) -> auto& {
-        if constexpr (Opaque) return worker.opaque_candidates[part];
+        if constexpr (Type == CandidateType::lower_hex) return worker.hex_candidates[part];
+        else if constexpr (Type == CandidateType::opaque_text) return worker.opaque_candidates[part];
         else return worker.candidates[part];
     };
+    using Record = std::conditional_t<Type == CandidateType::lower_hex, HexCandidate<Candidate>,
+        std::conditional_t<Type == CandidateType::opaque_text, OpaqueCandidate<Candidate>, Candidate>>;
     size_t count = 0;
     for (const auto& worker : workers) count += buffers(worker).size();
     if (!count) return;
@@ -629,7 +655,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
     size_t repeats = 0;
     for (auto& worker : workers) {
         buffers(worker).each([&](const Record& row) {
-            const size_t bucket = (row.id >> 8) & (buckets - 1);
+            const size_t bucket = (row.id >> partition_bits) & (buckets - 1);
             const uint64_t bit = uint64_t{1} << (bucket & 63);
             const size_t word = bucket >> 6;
             const uint64_t hit = seen[word] & bit;
@@ -648,7 +674,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
         links.resolve_batch(pending, pending_count);
         for (size_t i = 0; i < pending_count; ++i) {
             const Event& event = pending[i];
-            writer.events[event.person & (partitions - 1)].push_back(event);
+            writer.events[event.person & (person_partitions - 1)].push_back(event);
         }
         pending_count = 0;
     };
@@ -659,7 +685,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
     };
     for (auto& worker : workers) {
         buffers(worker).each([&](const Record& row) {
-            const uint64_t hash = row.id >> 8;
+            const uint64_t hash = row.id >> partition_bits;
             const size_t bucket = hash & (buckets - 1);
             if ((collided[bucket >> 6] & (uint64_t{1} << (bucket & 63))) == 0) {
                 emit(layout.event(row, workers));
@@ -667,7 +693,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
                 size_t i = hash & (slots - 1);
                 while (const Record* winner = winners[i]) {
                     if (winner->id == row.id) {
-                        if constexpr (!Opaque) break;
+                        if constexpr (Type == CandidateType::short_text) break;
                         else if (winner->same_identity(row)) break;
                     }
                     i = (i + 1) & (slots - 1);
@@ -693,7 +719,7 @@ class PersonGroups {
 
     size_t slot(Key person) const {
         const size_t mask = slots_.size() - 1;
-        size_t index = (person >> 8) & mask;
+        size_t index = (person >> person_partition_bits) & mask;
         while (slots_[index] != 0 && groups[slots_[index] - 1].person != person) {
             index = (index + 1) & mask;
         }
@@ -1175,10 +1201,16 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     keys.freeze();
     timer.stage("links and parse");
 
-    // The two streams have disjoint decoded ID lengths.
-    parallel(ncpu, partitions * 2, [&](size_t worker, size_t task) {
-        if (task < partitions) deduplicate<false>(task, workers, workers[worker], links, layout);
-        else deduplicate<true>(task - partitions, workers, workers[worker], links, layout);
+    // The streams are disjoint by decoded length and validated spelling.
+    parallel(ncpu, event_partitions + 2 * opaque_partitions, [&](size_t worker, size_t task) {
+        auto& writer = workers[worker];
+        if (task < event_partitions) {
+            deduplicate<CandidateType::short_text>(task, workers, writer, links, layout);
+        } else if (task < event_partitions + opaque_partitions) {
+            deduplicate<CandidateType::lower_hex>(task - event_partitions, workers, writer, links, layout);
+        } else {
+            deduplicate<CandidateType::opaque_text>(task - event_partitions - opaque_partitions, workers, writer, links, layout);
+        }
     });
     for (auto& worker : workers) {
         worker.candidate_storage.release();
@@ -1187,9 +1219,9 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     }
     timer.stage("event dedup");
 
-    std::vector<size_t> order(partitions);
+    std::vector<size_t> order(person_partitions);
     std::iota(order.begin(), order.end(), 0);
-    std::array<size_t, partitions> sizes{};
+    std::array<size_t, person_partitions> sizes{};
     for (size_t part : order) {
         for (const auto& worker : workers) {
             sizes[part] += worker.events[part].size() + worker.clicks[part].size();
@@ -1208,7 +1240,7 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     }
     const size_t time_buckets = (end - start + session_gap - 1) / session_gap;
     const size_t bucket_count = time_buckets <= 10000 ? time_buckets : 0;
-    parallel(ncpu, partitions, [&](size_t worker, size_t task) {
+    parallel(ncpu, person_partitions, [&](size_t worker, size_t task) {
         const size_t part = order[task];
         auto rows = group_by_person(workers, part, bucket_count, layout);
         summarize(rows, keys, catalog, *writers[worker], counts[worker], start, bucket_count);
