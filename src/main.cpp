@@ -383,7 +383,7 @@ public:
     ~RecordArena() { release(); }
 
     void release() {
-        for (char* slab : slabs_) munmap(slab, arena_slab_bytes);
+        for (char* slab : slabs_) std::free(slab);
         slabs_.clear();
         used_ = arena_slab_bytes;
     }
@@ -393,17 +393,8 @@ public:
             if (slabs_.size() == slabs_.capacity()) {
                 slabs_.reserve(std::max(size_t{4}, 2 * slabs_.capacity()));
             }
-            void* memory = mmap(nullptr, 2 * arena_slab_bytes, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (memory == MAP_FAILED) throw std::bad_alloc();
-            const auto address = reinterpret_cast<uintptr_t>(memory);
-            const auto aligned = (address + arena_slab_bytes - 1) & ~(arena_slab_bytes - 1);
-            auto* slab = reinterpret_cast<char*>(aligned);
-            const size_t before = aligned - address;
-            if (before != 0) munmap(memory, before);
-            munmap(slab + arena_slab_bytes, arena_slab_bytes - before);
-            // The advice is optional. The arena works with ordinary pages too.
-            madvise(slab, arena_slab_bytes, MADV_HUGEPAGE);
+            auto* slab = static_cast<char*>(std::aligned_alloc(arena_slab_bytes, arena_slab_bytes));
+            if (!slab) throw std::bad_alloc();
             slabs_.push_back(slab);
             used_ = 0;
         }

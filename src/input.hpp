@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -100,20 +101,17 @@ class Keys {
 #endif
     static constexpr size_t primary_size = size_t{1} << SHOPPING_PRIMARY_BITS;
 
-    struct PrimaryKey {
+    struct alignas(64) PrimaryKey {
         static constexpr size_t capacity = 40;
-        size_t hash;
-        size_t size;
-        char local[capacity];
-        std::unique_ptr<char[]> external;
+        static constexpr uint64_t empty = 0, building = 2;
+        std::atomic<uint64_t> tag;
+        uint8_t size;
+        char bytes[capacity];
 
-        PrimaryKey(size_t hash_value, Text value) : hash(hash_value), size(value.size()) {
-            if (size > capacity) external.reset(new char[size]);
-            if (size) std::memcpy(external ? external.get() : local, value.data(), size);
-        }
-
-        Text text() const { return Text(external ? external.get() : local, size); }
+        PrimaryKey() : tag(empty) {}
+        Text text() const { return Text(bytes, size); }
     };
+    static_assert(sizeof(PrimaryKey) == 64);
 
     struct alignas(64) Shard {
         struct Slot {
@@ -176,29 +174,33 @@ class Keys {
     };
 
     std::array<Shard, shard_count> shards_;
-    std::vector<std::atomic<PrimaryKey*>> primary_;
+    std::vector<PrimaryKey> primary_;
     bool frozen_ = false;
 
     Key try_primary(Text text, size_t hash) {
+        if (text.size() > PrimaryKey::capacity) return 0;
         constexpr size_t mask = primary_size - 1;
+        // A ready tag is odd. Full bytes still resolve any tag collision.
+        const uint64_t ready = hash | uint64_t{1};
         size_t at = hash & mask;
-        std::unique_ptr<PrimaryKey> pending;
-        for (unsigned probe = 0; probe < 24; ++probe) {
-            auto* prior = primary_[at].load(std::memory_order_acquire);
-            if (!prior) {
-                if (!pending) pending.reset(new PrimaryKey(hash, text));
-                if (primary_[at].compare_exchange_strong(prior, pending.get(),
-                        std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    pending.release();
-                    return wide | primary_tag | at;
-                }
+        for (unsigned probe = 0; probe < 24; ++probe, at = (at + 1) & mask) {
+            auto& slot = primary_[at];
+            auto tag = slot.tag.load(std::memory_order_acquire);
+            if (tag == PrimaryKey::empty &&
+                slot.tag.compare_exchange_strong(tag, PrimaryKey::building,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                slot.size = static_cast<uint8_t>(text.size());
+                if (slot.size) std::memcpy(slot.bytes, text.data(), slot.size);
+                slot.tag.store(ready, std::memory_order_release);
+                return wide | primary_tag | at;
             }
-            if (prior->hash == hash && prior->text() == text) return wide | primary_tag | at;
-            at = (at + 1) & mask;
+            // Advancing before publication could give an equal string a second key.
+            while (tag == PrimaryKey::building) {
+                std::this_thread::yield();
+                tag = slot.tag.load(std::memory_order_acquire);
+            }
+            if (tag == ready && slot.text() == text) return wide | primary_tag | at;
         }
-
-        // Occupied slots never move. If the whole probe range is occupied
-        // without a match, this spelling will always use the exact fallback.
         return 0;
     }
 
@@ -212,13 +214,7 @@ class Keys {
     }
 
 public:
-    Keys() : primary_(primary_size) {
-        for (auto& slot : primary_) std::atomic_init(&slot, static_cast<PrimaryKey*>(nullptr));
-    }
-
-    ~Keys() {
-        for (auto& slot : primary_) delete slot.load(std::memory_order_relaxed);
-    }
+    Keys() : primary_(primary_size) {}
 
     Key encode(Text text) {
         if (text.size() == 9 && (text.front() == 'e' || text.front() == 'u')) {
@@ -272,7 +268,9 @@ public:
         }
         if ((key & wide) == 0) return decode(key, buffer);
         if (key & primary_tag) {
-            return primary_[key & (primary_size - 1)].load(std::memory_order_acquire)->text();
+            const auto& slot = primary_[key & (primary_size - 1)];
+            (void)slot.tag.load(std::memory_order_acquire);
+            return slot.text();
         }
         Shard& shard = shards_[key & (shard_count - 1)];
         const size_t slot = (key & ~wide) >> shard_bits;
