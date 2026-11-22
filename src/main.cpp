@@ -451,12 +451,24 @@ public:
 template<class Candidate>
 struct OpaqueCandidate : Candidate {
     const char* identity;
-    size_t size;
+
+    bool same_identity(const OpaqueCandidate& other) const {
+        // The lengths match whenever the fingerprints match. Oversized CSV fields retain their validated delimiter.
+        const size_t length = this->id >> 56;
+        if (length != UINT8_MAX) return std::memcmp(identity, other.identity, length) == 0;
+        const char* a = identity;
+        const char* b = other.identity;
+        for (;;) {
+            const char left = *a++, right = *b++;
+            if (left == ',' || left == '"') return right == ',' || right == '"';
+            if (left != right) return false;
+        }
+    }
 };
 
 template<class Layout>
 struct WorkerInput {
-    RecordArena candidate_storage, event_storage;
+    RecordArena candidate_storage, event_storage, identity_storage;
     std::array<RecordBuffers<typename Layout::Candidate>, partitions> candidates;
     std::array<RecordBuffers<OpaqueCandidate<typename Layout::Candidate>, 512>, partitions> opaque_candidates;
     std::vector<WideEvents::Candidate> extra;
@@ -546,11 +558,19 @@ void event_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& cata
             worker.candidates[id & (partitions - 1)].push_back(
                 layout.candidate(id, ingest.order, event, worker.extra, worker_id));
         } else {
-            const Key fingerprint = std::hash<Text>{}(c[0]);
-            const char* identity = mapped + (c[0].data() - bytes.data());
+            constexpr Key hash_mask = (Key{1} << 56) - 1;
+            const Key length = std::min(c[0].size(), static_cast<size_t>(UINT8_MAX));
+            const Key fingerprint = (length << 56) | (std::hash<Text>{}(c[0]) & hash_mask);
+            const char* identity;
+            if (length == UINT8_MAX) {
+                identity = mapped + (c[0].data() - bytes.data());
+            } else {
+                auto* owned = static_cast<char*>(worker.identity_storage.allocate(length));
+                std::memcpy(owned, c[0].data(), length);
+                identity = owned;
+            }
             worker.opaque_candidates[fingerprint & (partitions - 1)].push_back(
-                {layout.candidate(fingerprint, ingest.order, event, worker.extra, worker_id),
-                 identity, c[0].size()});
+                {layout.candidate(fingerprint, ingest.order, event, worker.extra, worker_id), identity});
         }
     });
 }
@@ -635,7 +655,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
                 while (const Record* winner = winners[i]) {
                     if (winner->id == row.id) {
                         if constexpr (!Opaque) break;
-                        else if (Text(winner->identity, winner->size) == Text(row.identity, row.size)) break;
+                        else if (winner->same_identity(row)) break;
                     }
                     i = (i + 1) & (slots - 1);
                 }
@@ -1145,6 +1165,7 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
     });
     for (auto& worker : workers) {
         worker.candidate_storage.release();
+        worker.identity_storage.release();
         std::vector<WideEvents::Candidate>().swap(worker.extra);
     }
     timer.stage("event dedup");
