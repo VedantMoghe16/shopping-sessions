@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -63,7 +64,17 @@ class Keys {
     static constexpr Key byte_highs = UINT64_C(0x8080808080808080);
     static constexpr unsigned shard_bits = 8;
     static constexpr size_t shard_count = size_t{1} << shard_bits;
-    static constexpr Key slot_limit = (raw_suffix ^ wide) >> shard_bits;
+    static constexpr Key primary_tag = Key{1} << 54;
+    static constexpr Key slot_limit = primary_tag >> shard_bits;
+#ifndef SHOPPING_PRIMARY_BITS
+#define SHOPPING_PRIMARY_BITS 20
+#endif
+    static constexpr size_t primary_size = size_t{1} << SHOPPING_PRIMARY_BITS;
+
+    struct PrimaryKey {
+        size_t hash;
+        std::string text;
+    };
 
     struct alignas(64) Shard {
         struct Slot {
@@ -126,7 +137,31 @@ class Keys {
     };
 
     std::array<Shard, shard_count> shards_;
+    std::vector<std::atomic<PrimaryKey*>> primary_;
     bool frozen_ = false;
+
+    Key try_primary(Text text, size_t hash) {
+        constexpr size_t mask = primary_size - 1;
+        size_t at = hash & mask;
+        std::unique_ptr<PrimaryKey> pending;
+        for (unsigned probe = 0; probe < 24; ++probe) {
+            auto* prior = primary_[at].load(std::memory_order_acquire);
+            if (!prior) {
+                if (!pending) pending.reset(new PrimaryKey{hash, std::string(text)});
+                if (primary_[at].compare_exchange_strong(prior, pending.get(),
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    pending.release();
+                    return wide | primary_tag | at;
+                }
+            }
+            if (prior->hash == hash && prior->text == text) return wide | primary_tag | at;
+            at = (at + 1) & mask;
+        }
+
+        // Occupied slots never move. If the whole probe range is occupied
+        // without a match, this spelling will always use the exact fallback.
+        return 0;
+    }
 
     static Text decode(Key key, char (&buffer)[9]) {
         size_t size = 0;
@@ -138,6 +173,14 @@ class Keys {
     }
 
 public:
+    Keys() : primary_(primary_size) {
+        for (auto& slot : primary_) std::atomic_init(&slot, static_cast<PrimaryKey*>(nullptr));
+    }
+
+    ~Keys() {
+        for (auto& slot : primary_) delete slot.load(std::memory_order_relaxed);
+    }
+
     Key encode(Text text) {
         if (text.size() == 9 && (text.front() == 'e' || text.front() == 'u')) {
             Key suffix;
@@ -172,6 +215,7 @@ public:
             }
         }
         const size_t hash = std::hash<Text>{}(text);
+        if (const Key primary = try_primary(text, hash)) return primary;
         const size_t shard = hash >> (64 - shard_bits);
         const size_t slot = shards_[shard].intern(text, hash);
         return wide | shard | (slot << shard_bits);
@@ -188,6 +232,9 @@ public:
             return Text(buffer, 9);
         }
         if ((key & wide) == 0) return decode(key, buffer);
+        if (key & primary_tag) {
+            return primary_[key & (primary_size - 1)].load(std::memory_order_acquire)->text;
+        }
         Shard& shard = shards_[key & (shard_count - 1)];
         const size_t slot = (key & ~wide) >> shard_bits;
         if (frozen_) return shard.strings[slot];
@@ -249,6 +296,35 @@ inline size_t next_line(Text bytes, size_t pos) {
 
 template<class Visit>
 void lines(Text bytes, Visit visit) {
+    if (bytes.empty()) return;
+#if defined(__AVX2__)
+    constexpr size_t block_size = 64;
+    const auto lf = _mm256_set1_epi8('\n');
+    const auto newline_mask = [&](const char* data) {
+        const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
+        return static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, lf))));
+    };
+    const char* start = bytes.data();
+    const char* const end = start + bytes.size();
+    const char* cursor = start;
+    for (; end - cursor >= block_size; cursor += block_size) {
+        uint64_t found = newline_mask(cursor);
+        if constexpr (block_size == 64) found |= newline_mask(cursor + 32) << 32;
+        while (found) {
+            const char* newline = cursor + __builtin_ctzll(found);
+            visit(Text(start, newline - start));
+            start = newline + 1;
+            found &= found - 1;
+        }
+    }
+    for (; cursor != end; ++cursor) {
+        if (*cursor == '\n') {
+            visit(Text(start, cursor - start));
+            start = cursor + 1;
+        }
+    }
+    if (start != end) visit(Text(start, end - start));
+#else
     while (!bytes.empty()) {
         const size_t newline = bytes.find('\n');
         if (newline == Text::npos) {
@@ -258,6 +334,7 @@ void lines(Text bytes, Visit visit) {
         visit(bytes.substr(0, newline));
         bytes.remove_prefix(newline + 1);
     }
+#endif
 }
 
 #ifdef __AVX2__
