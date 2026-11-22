@@ -419,25 +419,30 @@ class RecordBuffers {
     static_assert(std::is_trivially_destructible_v<Record>);
     std::vector<Record*> pages_;
     RecordArena* arena_ = nullptr;
-    size_t size_ = 0;
+    Record* next_ = nullptr;
+    Record* end_ = nullptr;
 
 public:
     void set_arena(RecordArena& arena) { arena_ = &arena; }
-    size_t size() const { return size_; }
+    size_t size() const {
+        if (pages_.empty()) return 0;
+        return pages_.size() * page_rows - static_cast<size_t>(end_ - next_);
+    }
 
     void push_back(const Record& row) {
-        const size_t offset = size_ % page_rows;
-        if (offset == 0) {
+        if (next_ == end_) {
             void* memory = arena_->allocate(sizeof(Record) * page_rows);
-            pages_.push_back(::new (memory) Record[page_rows]);
+            auto* const page = ::new (memory) Record[page_rows];
+            pages_.push_back(page);
+            next_ = page;
+            end_ = page + page_rows;
         }
-        pages_.back()[offset] = row;
-        ++size_;
+        *next_++ = row;
     }
 
     template<class Visit>
     void each(Visit visit) {
-        size_t remaining = size_;
+        size_t remaining = size();
         for (const auto& page : pages_) {
             const size_t count = std::min(page_rows, remaining);
             for (size_t i = 0; i < count; ++i) visit(page[i]);
@@ -447,7 +452,7 @@ public:
 
     void clear() {
         pages_.clear();
-        size_ = 0;
+        next_ = end_ = nullptr;
     }
 };
 
@@ -567,8 +572,15 @@ void event_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& cata
         const auto [ingest, time] = event_times(c[2], c[3]);
         if (ingest.order == 0) throw std::runtime_error("invalid guaranteed ingest_ts");
         typename Layout::Event event{};
-        const bool purchase = c[4] == "purchase";
-        if (!c[1].empty() && !c[5].empty() && (purchase || c[4] == "view" || c[4] == "cart")
+        const Text type = c[4];
+        const bool purchase = type.size() == 8 && std::memcmp(type.data(), "purchase", 8) == 0;
+        bool known = purchase;
+        if (type.size() == 4) {
+            const bool view = std::memcmp(type.data(), "view", 4) == 0;
+            const bool cart = std::memcmp(type.data(), "cart", 4) == 0;
+            known = view | cart;
+        }
+        if (!c[1].empty() && !c[5].empty() && known
             && time >= start && time < end && ingest.timely(time)) {
             const Time price = purchase ? digits(c[6], 10000000) : 0;
             if (!purchase || price > 0) {
