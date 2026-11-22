@@ -101,8 +101,18 @@ class Keys {
     static constexpr size_t primary_size = size_t{1} << SHOPPING_PRIMARY_BITS;
 
     struct PrimaryKey {
+        static constexpr size_t capacity = 40;
         size_t hash;
-        std::string text;
+        size_t size;
+        char local[capacity];
+        std::unique_ptr<char[]> external;
+
+        PrimaryKey(size_t hash_value, Text value) : hash(hash_value), size(value.size()) {
+            if (size > capacity) external.reset(new char[size]);
+            if (size) std::memcpy(external ? external.get() : local, value.data(), size);
+        }
+
+        Text text() const { return Text(external ? external.get() : local, size); }
     };
 
     struct alignas(64) Shard {
@@ -176,14 +186,14 @@ class Keys {
         for (unsigned probe = 0; probe < 24; ++probe) {
             auto* prior = primary_[at].load(std::memory_order_acquire);
             if (!prior) {
-                if (!pending) pending.reset(new PrimaryKey{hash, std::string(text)});
+                if (!pending) pending.reset(new PrimaryKey(hash, text));
                 if (primary_[at].compare_exchange_strong(prior, pending.get(),
                         std::memory_order_acq_rel, std::memory_order_acquire)) {
                     pending.release();
                     return wide | primary_tag | at;
                 }
             }
-            if (prior->hash == hash && prior->text == text) return wide | primary_tag | at;
+            if (prior->hash == hash && prior->text() == text) return wide | primary_tag | at;
             at = (at + 1) & mask;
         }
 
@@ -262,7 +272,7 @@ public:
         }
         if ((key & wide) == 0) return decode(key, buffer);
         if (key & primary_tag) {
-            return primary_[key & (primary_size - 1)].load(std::memory_order_acquire)->text;
+            return primary_[key & (primary_size - 1)].load(std::memory_order_acquire)->text();
         }
         Shard& shard = shards_[key & (shard_count - 1)];
         const size_t slot = (key & ~wide) >> shard_bits;
