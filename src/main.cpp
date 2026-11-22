@@ -364,6 +364,7 @@ struct Click {
     Time time;
     Key id;
     uint32_t campaign;
+    uint32_t opaque_size;
 };
 
 constexpr size_t arena_slab_bytes = 2 * 1024 * 1024;
@@ -447,16 +448,24 @@ public:
     }
 };
 
+template<class Candidate>
+struct OpaqueCandidate : Candidate {
+    const char* identity;
+    size_t size;
+};
+
 template<class Layout>
 struct WorkerInput {
     RecordArena candidate_storage, event_storage;
     std::array<RecordBuffers<typename Layout::Candidate>, partitions> candidates;
+    std::array<RecordBuffers<OpaqueCandidate<typename Layout::Candidate>, 512>, partitions> opaque_candidates;
     std::vector<WideEvents::Candidate> extra;
     std::array<RecordBuffers<typename Layout::Event, 512>, partitions> events;
     std::array<std::vector<Click>, partitions> clicks;
 
     WorkerInput() {
         for (auto& buffer : candidates) buffer.set_arena(candidate_storage);
+        for (auto& buffer : opaque_candidates) buffer.set_arena(candidate_storage);
         for (auto& buffer : events) buffer.set_arena(event_storage);
     }
 };
@@ -510,14 +519,12 @@ public:
 };
 
 template<class Layout>
-void event_chunk(Text bytes, Keys& keys, const Catalog& catalog,
+void event_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& catalog,
                  WorkerInput<Layout>& worker, size_t worker_id, Time start, Time end,
                  const Layout& layout) {
     std::array<Text, 7> c;
     lines(bytes, [&](Text row) {
         if (!fields(row, c) || c[0].empty()) return;
-        // The mixer is a bijection, so its result remains an exact event key.
-        const Key id = hash_key(keys.encode(c[0]));
         const auto [ingest, time] = event_times(c[2], c[3]);
         if (ingest.order == 0) throw std::runtime_error("invalid guaranteed ingest_ts");
         typename Layout::Event event{};
@@ -534,13 +541,22 @@ void event_chunk(Text bytes, Keys& keys, const Catalog& catalog,
                 event = layout.make(keys.encode(c[1]), time, static_cast<uint32_t>(price), category);
             }
         }
-        worker.candidates[id & (partitions - 1)].push_back(
-            layout.candidate(id, ingest.order, event, worker.extra, worker_id));
+        if (c[0].size() <= 9) {
+            const Key id = hash_key(keys.encode(c[0]));
+            worker.candidates[id & (partitions - 1)].push_back(
+                layout.candidate(id, ingest.order, event, worker.extra, worker_id));
+        } else {
+            const Key fingerprint = std::hash<Text>{}(c[0]);
+            const char* identity = mapped + (c[0].data() - bytes.data());
+            worker.opaque_candidates[fingerprint & (partitions - 1)].push_back(
+                {layout.candidate(fingerprint, ingest.order, event, worker.extra, worker_id),
+                 identity, c[0].size()});
+        }
     });
 }
 
 template<class Layout>
-void click_chunk(Text bytes, Keys& keys, const Catalog& catalog, const Links& links,
+void click_chunk(Text bytes, const char* mapped, Keys& keys, const Catalog& catalog, const Links& links,
                  WorkerInput<Layout>& worker, Time start, Time end) {
     std::array<Text, 4> c;
     lines(bytes, [&](Text row) {
@@ -550,24 +566,36 @@ void click_chunk(Text bytes, Keys& keys, const Catalog& catalog, const Links& li
         const uint32_t campaign = catalog.campaign(c[2], keys);
         if (campaign == 0) return;
         const Key person = links.mixed_person(keys.encode(c[1]));
-        worker.clicks[person & (partitions - 1)].push_back({person, time, keys.encode(c[0]), campaign});
+        const auto size = c[0].size();
+        if (size > 9 && size <= UINT32_MAX) {
+            const auto* address = mapped + (c[0].data() - bytes.data());
+            worker.clicks[person & (partitions - 1)].push_back(
+                {person, time, reinterpret_cast<uintptr_t>(address), campaign, static_cast<uint32_t>(size)});
+        } else {
+            worker.clicks[person & (partitions - 1)].push_back({person, time, keys.encode(c[0]), campaign, 0});
+        }
     });
 }
 
-template<class Layout>
+template<bool Opaque, class Layout>
 void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerInput<Layout>& writer,
                  const Links& links, const Layout& layout) {
-    using Record = typename Layout::Candidate;
+    using Candidate = typename Layout::Candidate;
+    using Record = std::conditional_t<Opaque, OpaqueCandidate<Candidate>, Candidate>;
     using Event = typename Layout::Event;
+    const auto buffers = [part](auto& worker) -> auto& {
+        if constexpr (Opaque) return worker.opaque_candidates[part];
+        else return worker.candidates[part];
+    };
     size_t count = 0;
-    for (const auto& worker : workers) count += worker.candidates[part].size();
+    for (const auto& worker : workers) count += buffers(worker).size();
     if (!count) return;
     size_t buckets = 64;
     while (buckets < 16 * count) buckets *= 2;
     std::vector<uint64_t> seen(buckets / 64), collided(buckets / 64);
     size_t repeats = 0;
     for (auto& worker : workers) {
-        worker.candidates[part].each([&](const Record& row) {
+        buffers(worker).each([&](const Record& row) {
             const size_t bucket = (row.id >> 8) & (buckets - 1);
             const uint64_t bit = uint64_t{1} << (bucket & 63);
             const size_t word = bucket >> 6;
@@ -597,14 +625,20 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
         if (pending_count == pending.size()) flush();
     };
     for (auto& worker : workers) {
-        worker.candidates[part].each([&](const Record& row) {
+        buffers(worker).each([&](const Record& row) {
             const uint64_t hash = row.id >> 8;
             const size_t bucket = hash & (buckets - 1);
             if ((collided[bucket >> 6] & (uint64_t{1} << (bucket & 63))) == 0) {
                 emit(layout.event(row, workers));
             } else {
                 size_t i = hash & (slots - 1);
-                while (winners[i] && winners[i]->id != row.id) i = (i + 1) & (slots - 1);
+                while (const Record* winner = winners[i]) {
+                    if (winner->id == row.id) {
+                        if constexpr (!Opaque) break;
+                        else if (Text(winner->identity, winner->size) == Text(row.identity, row.size)) break;
+                    }
+                    i = (i + 1) & (slots - 1);
+                }
                 if (!winners[i] || layout.ingest(row, workers) < layout.ingest(*winners[i], workers)) winners[i] = &row;
             }
         });
@@ -613,7 +647,7 @@ void deduplicate(size_t part, std::vector<WorkerInput<Layout>>& workers, WorkerI
         if (winner) emit(layout.event(*winner, workers));
     }
     if (pending_count) flush();
-    for (auto& worker : workers) worker.candidates[part].clear();
+    for (auto& worker : workers) buffers(worker).clear();
 }
 
 struct PersonGroup {
@@ -660,7 +694,18 @@ struct TimedClick {
     Time time;
     Key id;
     uint32_t campaign;
+    uint32_t opaque_size;
 };
+
+bool click_id_less(const TimedClick& a, const TimedClick& b, Keys& keys) {
+    if ((a.opaque_size | b.opaque_size) == 0) return keys.less(a.id, b.id);
+    char a_buffer[9], b_buffer[9];
+    const auto text = [&](const TimedClick& click, char (&buffer)[9]) {
+        return click.opaque_size ? Text(reinterpret_cast<const char*>(click.id), click.opaque_size)
+                                 : keys.text(click.id, buffer);
+    };
+    return text(a, a_buffer).compare(text(b, b_buffer)) < 0;
+}
 
 struct PersonPartition {
     std::vector<TimedEvent> events;
@@ -707,7 +752,7 @@ PersonPartition group_by_person(std::vector<WorkerInput<Layout>>& workers, size_
         for (const Click& click : worker.clicks[part]) {
             if (click.person) {
                 PersonGroup& group = index.groups[click.person - 1];
-                result.clicks[--group.click_end] = {click.time, click.id, click.campaign};
+                result.clicks[--group.click_end] = {click.time, click.id, click.campaign, click.opaque_size};
             }
         }
         std::vector<Click>().swap(worker.clicks[part]);
@@ -866,7 +911,7 @@ struct Attribution {
 
             const TimedClick*& winner = latest[first];
             if (!winner || click.time > winner->time ||
-                (click.time == winner->time && keys.less(click.id, winner->id))) winner = &click;
+                (click.time == winner->time && click_id_less(click, *winner, keys))) winner = &click;
         }
 
         const TimedClick* best = nullptr;
@@ -904,7 +949,7 @@ struct Attribution {
         for (const Session& session : sessions) {
             while (begin < end && clicks[begin].time <= session.start) {
                 const TimedClick& click = clicks[begin++];
-                if (!best || click.time > best->time || keys.less(click.id, best->id)) best = &click;
+                if (!best || click.time > best->time || click_id_less(click, *best, keys)) best = &click;
             }
             add_credit(session, best);
         }
@@ -1084,17 +1129,19 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
         const Chunk& chunk = chunks[task - 1];
         const Text bytes = readers[worker].read(chunk);
         if (chunk.events) {
-            event_chunk(bytes, keys, catalog, workers[worker], worker, start, end, layout);
+            event_chunk(bytes, chunk.mapped, keys, catalog, workers[worker], worker, start, end, layout);
         } else {
             links_ready.get();
-            click_chunk(bytes, keys, catalog, links, workers[worker], start, end);
+            click_chunk(bytes, chunk.mapped, keys, catalog, links, workers[worker], start, end);
         }
     });
     keys.freeze();
     timer.stage("links and parse");
 
-    parallel(ncpu, partitions, [&](size_t worker, size_t part) {
-        deduplicate(part, workers, workers[worker], links, layout);
+    // The two streams have disjoint decoded ID lengths.
+    parallel(ncpu, partitions * 2, [&](size_t worker, size_t task) {
+        if (task < partitions) deduplicate<false>(task, workers, workers[worker], links, layout);
+        else deduplicate<true>(task - partitions, workers, workers[worker], links, layout);
     });
     for (auto& worker : workers) {
         worker.candidate_storage.release();
