@@ -718,7 +718,14 @@ struct PersonGroup {
 };
 
 class PersonGroups {
-    std::vector<uint32_t> slots_ = std::vector<uint32_t>(256);
+    static size_t initial_slots(size_t event_count) {
+        const size_t target = std::min(event_count / 8, size_t{16384});
+        size_t count = 256;
+        while (count < target) count *= 2;
+        return count;
+    }
+
+    std::vector<uint32_t> slots_;
 
     size_t slot(Key person) const {
         const size_t mask = slots_.size() - 1;
@@ -731,6 +738,10 @@ class PersonGroups {
 
 public:
     std::vector<PersonGroup> groups;
+
+    explicit PersonGroups(size_t event_count) : slots_(initial_slots(event_count)) {
+        groups.reserve(std::min(event_count / 16, size_t{8192}));
+    }
 
     uint32_t add(Key person) {
         size_t index = slot(person);
@@ -779,14 +790,14 @@ template<class Layout>
 PersonPartition group_by_person(std::vector<WorkerInput<Layout>>& workers, size_t part,
                                 size_t bucket_count, const Layout& layout) {
     using Event = typename Layout::Event;
-    PersonGroups index;
     size_t event_count = 0, click_count = 0;
+    for (const auto& worker : workers) event_count += worker.events[part].size();
+    PersonGroups index(event_count);
     for (auto& worker : workers) {
         worker.events[part].each([&](Event& event) {
             event.person = index.add(event.person);
             ++index.groups[event.person].events;
         });
-        event_count += worker.events[part].size();
     }
     for (auto& worker : workers) {
         for (Click& click : worker.clicks[part]) {
