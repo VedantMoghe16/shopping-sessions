@@ -1,6 +1,6 @@
 #pragma once
 
-#include <deque>
+#include <memory>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -61,9 +61,72 @@ class Keys {
     static constexpr Key raw_suffix = wide | (Key{1} << 55);
     static constexpr Key user_prefix = Key{1} << 47;
     static constexpr Key byte_highs = UINT64_C(0x8080808080808080);
-    std::mutex mutex_;
-    std::deque<std::string> strings_;
-    std::unordered_map<Text, Key> indices_;
+    static constexpr unsigned shard_bits = 8;
+    static constexpr size_t shard_count = size_t{1} << shard_bits;
+    static constexpr Key slot_limit = (raw_suffix ^ wide) >> shard_bits;
+
+    struct alignas(64) Shard {
+        struct Slot {
+            size_t hash = 0;
+            size_t index = 0;
+        };
+
+        std::mutex mutex;
+        std::vector<Text> strings;
+        std::vector<Slot> slots;
+        std::vector<std::unique_ptr<char[]>> blocks;
+        size_t used = 0, capacity = 0;
+
+        static size_t bucket(const std::vector<Slot>& table, size_t hash) {
+            return hash & (table.size() - 1);
+        }
+
+        void grow() {
+            std::vector<Slot> larger(slots.empty() ? 32 : slots.size() * 2);
+            const size_t mask = larger.size() - 1;
+            for (const Slot& old : slots) {
+                if (!old.index) continue;
+                size_t at = bucket(larger, old.hash);
+                while (larger[at].index) at = (at + 1) & mask;
+                larger[at] = old;
+            }
+            slots.swap(larger);
+        }
+
+        Text own(Text value) {
+            if (value.size() > capacity - used) {
+                const size_t next = std::max(value.size(), size_t{64 * 1024});
+                std::unique_ptr<char[]> block(new char[next]);
+                blocks.push_back(std::move(block));
+                capacity = next;
+                used = 0;
+            }
+            char* const location = blocks.back().get() + used;
+            std::memcpy(location, value.data(), value.size());
+            used += value.size();
+            return Text(location, value.size());
+        }
+
+        size_t intern(Text value, size_t hash) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (slots.empty() || strings.size() >= slots.size() - slots.size() / 4) grow();
+            const size_t mask = slots.size() - 1;
+            size_t at = bucket(slots, hash);
+            while (slots[at].index) {
+                const Slot& item = slots[at];
+                if (item.hash == hash && strings[item.index - 1] == value) return item.index - 1;
+                at = (at + 1) & mask;
+            }
+            const size_t index = strings.size();
+            if (index >= slot_limit) throw std::runtime_error("too many wide IDs");
+            strings.push_back(own(value));
+            slots[at] = {hash, index + 1};
+            return index;
+        }
+    };
+
+    std::array<Shard, shard_count> shards_;
+    bool frozen_ = false;
 
     static Text decode(Key key, char (&buffer)[9]) {
         size_t size = 0;
@@ -108,15 +171,14 @@ public:
                 return index == 0 ? 0 : key << (63 - index * 7);
             }
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto prior = indices_.find(text);
-        if (prior != indices_.end()) return prior->second;
-        if (strings_.size() >= (raw_suffix ^ wide)) throw std::runtime_error("too many wide IDs");
-        const Key key = wide | strings_.size();
-        strings_.emplace_back(text);
-        indices_.emplace(Text(strings_.back()), key);
-        return key;
+        const size_t hash = std::hash<Text>{}(text);
+        const size_t shard = hash >> (64 - shard_bits);
+        const size_t slot = shards_[shard].intern(text, hash);
+        return wide | shard | (slot << shard_bits);
     }
+
+    // All encoding workers have joined before consumers read the frozen store.
+    void freeze() { frozen_ = true; }
 
     Text text(Key key, char (&buffer)[9]) {
         if ((key & raw_suffix) == raw_suffix) {
@@ -126,8 +188,11 @@ public:
             return Text(buffer, 9);
         }
         if ((key & wide) == 0) return decode(key, buffer);
-        std::lock_guard<std::mutex> lock(mutex_);
-        return strings_[key & ~wide];
+        Shard& shard = shards_[key & (shard_count - 1)];
+        const size_t slot = (key & ~wide) >> shard_bits;
+        if (frozen_) return shard.strings[slot];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        return shard.strings[slot];
     }
 
     bool less(Key a, Key b) {

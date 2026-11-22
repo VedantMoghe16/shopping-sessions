@@ -1090,6 +1090,7 @@ int process(const fs::path& data, const fs::path& output, Time start, Time end, 
             click_chunk(bytes, keys, catalog, links, workers[worker], start, end);
         }
     });
+    keys.freeze();
     timer.stage("links and parse");
 
     parallel(ncpu, partitions, [&](size_t worker, size_t part) {
